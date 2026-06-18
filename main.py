@@ -18,6 +18,9 @@ future_account = None
 class ConnectRequest(BaseModel):
     api_key: str
     secret_key: str
+    ca_path:     str = ""   # 可選：CA 憑證路徑 (.pfx)，用於查詢庫存與下真實委託
+    ca_password: str = ""   # 可選：CA 憑證密碼
+    person_id:   str = ""   # 可選：身分證字號，CA 啟用用
 
 class OrderRequest(BaseModel):
     symbol:     str
@@ -46,6 +49,17 @@ async def connect(req: ConnectRequest):
         api = sj.Shioaji(simulation=False)
         accounts = api.login(api_key=req.api_key, secret_key=req.secret_key)
         sinopac_api = api
+        # 嘗試啟用 CA 憑證（若有提供，用於查詢庫存與下真實委託）
+        if req.ca_path and req.ca_password and req.person_id:
+            try:
+                api.activate_ca(
+                    ca_path=req.ca_path,
+                    ca_passwd=req.ca_password,
+                    person_id=req.person_id,
+                )
+                logger.info("CA 憑證啟用成功")
+            except Exception as ca_e:
+                logger.warning(f"CA 憑證啟用失敗（不影響基本連線）: {ca_e}")
         for acc in accounts:
             # 相容不同版本 shioaji 的帳戶類型判斷
             type_name = type(acc).__name__
@@ -110,6 +124,12 @@ async def get_positions():
                 positions = sinopac_api.list_positions(stock_account)
             except Exception:
                 positions = sinopac_api.list_positions()
+        # 若帶帳戶參數回傳空，再試不帶參數（有些版本不需要傳帳戶）
+        if not positions:
+            try:
+                positions = sinopac_api.list_positions()
+            except Exception:
+                pass
         if not positions:
             return []
         result = []
