@@ -85,10 +85,13 @@ async def get_account():
         raise HTTPException(status_code=401, detail="尚未連接永豐帳戶")
     try:
         bal = sinopac_api.account_balance()
+        # 相容不同屬性名稱
+        balance   = float(getattr(bal, "acc_balance", None) or getattr(bal, "balance", 0))
+        available = float(getattr(bal, "available_balance", None) or getattr(bal, "available", 0))
         return {
             "account":   str(stock_account),
-            "balance":   float(bal.acc_balance),
-            "available": float(bal.available_balance),
+            "balance":   balance,
+            "available": available,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -99,20 +102,43 @@ async def get_positions():
     if not sinopac_api:
         raise HTTPException(status_code=401, detail="尚未連接永豐帳戶")
     try:
-        positions = sinopac_api.list_positions(stock_account, unit=sj.constant.Unit.Share)
-        return [{
-            "symbol":        p.code,
-            "name":          getattr(p, "name", p.code),
-            "quantity":      int(p.quantity),
-            "avg_price":     float(p.price),
-            "current_price": float(getattr(p, "last_price", 0)),
-            "pnl":           float(getattr(p, "pnl", 0)),
-            "pnl_percent":   float(getattr(p, "pnl_percent", 0)),
-            "direction":     str(getattr(p, "direction", "Buy")),
-            "value":         float(getattr(p, "last_price", 0) * p.quantity),
-        } for p in positions]
+        # 相容不同版本 shioaji：先試帶 unit 參數，失敗則不帶
+        try:
+            positions = sinopac_api.list_positions(stock_account, unit=sj.constant.Unit.Share)
+        except AttributeError:
+            try:
+                positions = sinopac_api.list_positions(stock_account)
+            except Exception:
+                positions = sinopac_api.list_positions()
+        if not positions:
+            return []
+        result = []
+        for p in positions:
+            try:
+                code    = getattr(p, "code", None) or getattr(p, "symbol", "")
+                qty     = int(getattr(p, "quantity", 0))
+                avg_p   = float(getattr(p, "price", 0) or getattr(p, "avg_price", 0))
+                last_p  = float(getattr(p, "last_price", 0) or getattr(p, "close", 0))
+                pnl     = float(getattr(p, "pnl", 0))
+                pnl_pct = float(getattr(p, "pnl_percent", 0))
+                value   = last_p * qty if last_p else avg_p * qty
+                result.append({
+                    "symbol":        code,
+                    "name":          getattr(p, "name", code),
+                    "quantity":      qty,
+                    "avg_price":     avg_p,
+                    "current_price": last_p,
+                    "pnl":           pnl,
+                    "pnl_percent":   pnl_pct,
+                    "direction":     str(getattr(p, "direction", "Buy")),
+                    "value":         value,
+                })
+            except Exception as pe:
+                logger.warning(f"解析持倉 {p} 失敗: {pe}")
+        return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"list_positions 失敗: {e}")
+        raise HTTPException(status_code=500, detail=f"持倉查詢失敗: {str(e)}")
 
 # ── 今日委託 ─────────────────────────────────────────────────────────────
 @app.get("/orders")
