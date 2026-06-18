@@ -47,10 +47,16 @@ async def connect(req: ConnectRequest):
         accounts = api.login(api_key=req.api_key, secret_key=req.secret_key)
         sinopac_api = api
         for acc in accounts:
-            if acc.account_type == sj.constant.AccountType.Stock:
+            # 相容不同版本 shioaji 的帳戶類型判斷
+            type_name = type(acc).__name__
+            acc_type_str = str(getattr(acc, 'account_type', '')).lower()
+            if 'stock' in type_name.lower() or 'stock' in acc_type_str:
                 stock_account = acc
-            elif acc.account_type == sj.constant.AccountType.Future:
+            elif 'future' in type_name.lower() or 'future' in acc_type_str:
                 future_account = acc
+        # 如果都沒分到，預設第一個帳戶給 stock
+        if stock_account is None and accounts:
+            stock_account = accounts[0]
         return {
             "success": True,
             "stock_account":  str(stock_account)  if stock_account  else None,
