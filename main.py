@@ -626,6 +626,7 @@ async def cancel_order(req:CancelRequest):
 @app.get("/price/{symbol}")
 async def get_price(symbol:str):
     if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
+    symbol=symbol.replace(".TW","").replace(".TWO","")  # 永豐合約代碼不含交易所後綴
     try:
         contract=sinopac_api.Contracts.Stocks.get(symbol)
         if not contract: raise HTTPException(status_code=404,detail=f"找不到 {symbol}")
