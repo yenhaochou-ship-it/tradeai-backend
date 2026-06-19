@@ -516,6 +516,32 @@ async def update_ml_predictions(req:MLPredictionsRequest):
 async def get_ml_predictions():
     return ml_predictions
 
+# ── AI學習狀態持久化（信心度/勝率/連勝/自適應權重，存在後端不會因換裝置或清快取而重置）──
+learn_state_store: Dict = {}  # 簡易持久化：存在記憶體，搭配 Railway 持續運行不重啟即可長期保留
+
+@app.post("/learn/state")
+async def save_learn_state(state: Dict):
+    global learn_state_store
+    learn_state_store = state
+    return {"success": True}
+
+@app.get("/learn/state")
+async def get_learn_state():
+    return learn_state_store or {}
+
+# ── ML 神經網路模型權重持久化（存在後端，換裝置/清瀏覽器快取也不會丟失訓練成果）──
+ml_model_store: Dict = {}
+
+@app.post("/ml/model")
+async def save_ml_model(model: Dict):
+    global ml_model_store
+    ml_model_store = model
+    return {"success": True}
+
+@app.get("/ml/model")
+async def get_ml_model():
+    return ml_model_store or {}
+
 # ── 交易成本試算（含手續費+當沖證交稅）──────────────────────────────
 @app.get("/fees/calc")
 async def calc_fees(entry_price:float,exit_price:float,qty:int=1000):
