@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 import shioaji as sj
-import os, logging, base64, tempfile, time
+import os, logging, base64, tempfile, time, sqlite3, json
 from datetime import datetime, timedelta
 import pytz
 import requests
@@ -16,6 +16,45 @@ from apscheduler.triggers.cron import CronTrigger
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ══════════════════════════════════════════════════════════════════
+# 資料庫持久化（SQLite + Railway Volume）
+# 重要：必須在 Railway 後台幫這個服務「掛載一個 Volume」，路徑設為 /data，
+# 否則資料庫檔案還是會在每次重新部署時被清空（跟之前記憶體版本同樣的問題）。
+# 沒有掛 Volume 時會自動退回容器內的暫存路徑，程式仍可正常運作，只是一樣不會跨部署保留。
+# ══════════════════════════════════════════════════════════════════
+DB_PATH = "/data/tradeai.db" if os.path.isdir("/data") else "/tmp/tradeai.db"
+
+def db_init():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+    conn.commit()
+    conn.close()
+    using_volume = os.path.isdir("/data")
+    logger.info(f"資料庫已初始化：{DB_PATH}（{'已使用Railway Volume，跨部署保留' if using_volume else '未掛載Volume，重新部署仍會清空'}）")
+
+def db_save(key: str, value: dict):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("INSERT INTO kv_store (key,value,updated_at) VALUES (?,?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                     (key, json.dumps(value), datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"資料庫寫入失敗 [{key}]: {e}")
+
+def db_load(key: str, default=None):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT value FROM kv_store WHERE key=?", (key,)).fetchone()
+        conn.close()
+        if row: return json.loads(row[0])
+    except Exception as e:
+        logger.warning(f"資料庫讀取失敗 [{key}]: {e}")
+    return default
+
+db_init()
 TW_TZ = pytz.timezone('Asia/Taipei')
 
 # ══════════════════════════════════════════════════════════════════
@@ -204,13 +243,21 @@ sinopac_api    = None
 stock_account  = None
 future_account = None
 
-auto_state = {
+_auto_state_defaults = {
     "enabled":False,"risk":"low","cap_pct":100,"paper_mode":True,  # 預設模擬下單，須使用者明確選擇才會送真實委託
     "watchlist":[],"positions":[],"log":[],
     "capital":1_000_000,
     "daily_pnl":0.0,"daily_win":0,"daily_trades":0,
     "consec_loss":0,"pause_until":0,"trade_date":None,
 }
+auto_state = db_load("auto_state", None) or dict(_auto_state_defaults)
+# 資料庫存的舊資料可能缺少新版新增的欄位，補齊避免KeyError
+for _k,_v in _auto_state_defaults.items():
+    auto_state.setdefault(_k,_v)
+
+def _persist_auto_state():
+    """把目前的auto_state存進資料庫，重新部署/當機後可以接續，而不是每次都從零開始"""
+    db_save("auto_state", auto_state)
 
 RISK_CFG = {
     "low":  {"min_conf":72,"alloc":0.05,"sl":2.0,"tp":4.0,"max_pos":3,"max_hold_min":25},
@@ -477,6 +524,7 @@ def force_close_all():
         act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
         _place_real_order(sym,act,pos["qty"])
     auto_state["positions"]=[]
+    _persist_auto_state()
 
 def post_market_summary():
     d=auto_state["daily_trades"] or 1
@@ -485,6 +533,11 @@ def post_market_summary():
 
 def ml_training_window():
     _log("21:00 ML訓練時段開始（前端訓練請在學習分頁執行）")
+
+def _periodic_persist():
+    """定期把auto_state存進資料庫（不放在auto_trade_tick裡面，因為那個函式有很多提早return的分支，
+    放在獨立排程更不容易漏掉某個情況沒存到）"""
+    _persist_auto_state()
 
 def _refresh_capital_from_account():
     """內部函式：從永豐真實帳戶刷新可用資金（扣除T+2交割款），供API端點與排程器共用，
@@ -520,6 +573,7 @@ def _refresh_capital_from_account():
 # ══════════════════════════════════════════════════════════════════
 scheduler=BackgroundScheduler(timezone='Asia/Taipei')
 scheduler.add_job(auto_trade_tick,    'interval',seconds=30,id='tick',replace_existing=True)
+scheduler.add_job(_periodic_persist,  'interval',seconds=60,id='persist',replace_existing=True) # 每分鐘把auto_state存進資料庫
 scheduler.add_job(_refresh_capital_from_account, 'interval',minutes=5,id='capital_refresh',replace_existing=True) # 確保後端自己定期跟永豐核對真實可用資金，不依賴前端
 scheduler.add_job(pre_market_prep,    CronTrigger(hour=8, minute=0, day_of_week='mon-fri'),id='prep')
 scheduler.add_job(force_close_all,    CronTrigger(hour=13,minute=20,day_of_week='mon-fri'),id='force_close')
@@ -645,12 +699,14 @@ async def auto_start(req:AutoStartRequest):
     _bootstrap_price_cache()  # 用真實歷史K棒暖機，避免重啟後空等15分鐘、且與前端顯示的訊號不一致
     mode_label="模擬下單（真實股價，不花真錢）" if req.paper_mode else "真實下單"
     _log(f"後端自動交易啟動 | {mode_label} | 風險:{req.risk} | 資金:{req.cap_pct}% | 自選股:{len(auto_state['watchlist'])}支")
+    _persist_auto_state()
     return {"success":True,"message":"後端自動交易已啟動","state":auto_state}
 
 @app.post("/auto/stop")
 async def auto_stop():
     auto_state["enabled"]=False
     _log("後端自動交易已停止")
+    _persist_auto_state()
     return {"success":True}
 
 @app.get("/auto/status")
@@ -679,25 +735,27 @@ async def get_ml_predictions():
     return ml_predictions
 
 # ── AI學習狀態持久化（信心度/勝率/連勝/自適應權重，存在後端不會因換裝置或清快取而重置）──
-learn_state_store: Dict = {}  # 簡易持久化：存在記憶體，搭配 Railway 持續運行不重啟即可長期保留
+learn_state_store: Dict = db_load("learn_state", {})  # 啟動時從資料庫還原（若已掛載Volume，跨重新部署也保留）
 
 @app.post("/learn/state")
 async def save_learn_state(state: Dict):
     global learn_state_store
     learn_state_store = state
+    db_save("learn_state", state)
     return {"success": True}
 
 @app.get("/learn/state")
 async def get_learn_state():
     return learn_state_store or {}
 
-# ── ML 神經網路模型權重持久化（存在後端，換裝置/清瀏覽器快取也不會丟失訓練成果）──
-ml_model_store: Dict = {}
+# ── ML 神經網路模型權重持久化（存資料庫，換裝置/清瀏覽器快取/後端重新部署都不會丟失訓練成果，前提是已掛載Volume）──
+ml_model_store: Dict = db_load("ml_model", {})
 
 @app.post("/ml/model")
 async def save_ml_model(model: Dict):
     global ml_model_store
     ml_model_store = model
+    db_save("ml_model", model)
     return {"success": True}
 
 @app.get("/ml/model")
