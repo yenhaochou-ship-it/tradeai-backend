@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict
 import shioaji as sj
 import os, logging, base64, tempfile, time
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -833,6 +833,43 @@ async def get_price(symbol:str):
         raise HTTPException(status_code=500,detail=str(e))
 
 # ── 交割記錄 ──────────────────────────────────────────────────────
+# ── 真實歷史K棒（取代前端亂數模擬，讓RSI/MACD/ML訓練都基於真實價格歷史）──────
+@app.get("/history/{symbol}")
+async def get_history(symbol:str, bars:int=90):
+    if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
+    symbol=symbol.replace(".TW","").replace(".TWO","")
+    try:
+        contract=sinopac_api.Contracts.Stocks.get(symbol)
+        if not contract: raise HTTPException(status_code=404,detail=f"找不到 {symbol}")
+        end_d=tw_now()
+        start_d=end_d-timedelta(days=10)  # 抓近10天涵蓋週末，確保拿到最近一個交易日的資料
+        kb=sinopac_api.kbars(contract,start=start_d.strftime("%Y-%m-%d"),end=end_d.strftime("%Y-%m-%d"))
+        if not kb or not kb.ts:
+            return {"symbol":symbol,"bars":[],"note":"無歷史資料（可能非交易日或新股）"}
+        n=len(kb.ts)
+        # 轉換並聚合成5分鐘K棒（kbars預設為1分鐘），取最近 bars*5 分鐘的資料
+        raw=[{"ts":kb.ts[i],"open":kb.Open[i],"high":kb.High[i],"low":kb.Low[i],
+              "close":kb.Close[i],"volume":kb.Volume[i]} for i in range(n)]
+        raw=raw[-(bars*5):]  # 1分鐘bar，取 bars*5 根換算成約 bars 根5分鐘bar
+        agg=[]
+        for i in range(0,len(raw),5):
+            chunk=raw[i:i+5]
+            if not chunk: continue
+            t=datetime.fromtimestamp(chunk[0]["ts"]/1e9,tz=TW_TZ)
+            agg.append({
+                "time":t.strftime("%H:%M"),
+                "price":chunk[-1]["close"],
+                "close":chunk[-1]["close"],
+                "open":chunk[0]["open"],
+                "high":max(c["high"] for c in chunk),
+                "low":min(c["low"] for c in chunk),
+                "volume":sum(c["volume"] for c in chunk),
+            })
+        return {"symbol":symbol,"bars":agg[-bars:],"source":"real_kbars"}
+    except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(status_code=500,detail=f"取得歷史資料失敗：{str(e)}")
+
 @app.get("/settlements")
 async def get_settlements():
     if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
