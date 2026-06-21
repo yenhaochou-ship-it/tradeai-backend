@@ -486,6 +486,35 @@ def post_market_summary():
 def ml_training_window():
     _log("21:00 ML訓練時段開始（前端訓練請在學習分頁執行）")
 
+def _refresh_capital_from_account():
+    """內部函式：從永豐真實帳戶刷新可用資金（扣除T+2交割款），供API端點與排程器共用，
+    確保即使前端沒開著，後端排程也會定期自己刷新，不會用過時的資金數字下單。
+    （注意：此函式定義必須放在 scheduler.add_job 註冊之前，否則模組載入時會NameError崩潰）"""
+    if not sinopac_api: return None
+    try:
+        bal=sinopac_api.account_balance()
+        balance=float(getattr(bal,"acc_balance",None) or getattr(bal,"balance",0))
+        avail  =float(getattr(bal,"available_balance",None) or getattr(bal,"available",0))
+        pending_settlement = 0.0
+        try:
+            setts = sinopac_api.settlements(stock_account)
+            today_str = tw_now().strftime("%Y-%m-%d")
+            for s in setts:
+                t_date = str(getattr(s,"t_date","") or getattr(s,"date",""))
+                if t_date and t_date >= today_str:
+                    pending_settlement += abs(float(s.amount))
+        except Exception as se:
+            logger.warning(f"無法取得交割資料，風控將以可用餘額為準（未扣交割款）: {se}")
+        available_after_settlement = max(0.0, avail - pending_settlement)
+        if available_after_settlement>0:
+            auto_state["capital"]=available_after_settlement
+        return {"account":str(stock_account),"balance":balance,"available":avail,
+                "pending_settlement":pending_settlement,
+                "available_after_settlement":available_after_settlement}
+    except Exception as e:
+        logger.warning(f"刷新可用資金失敗: {e}")
+        return None
+
 # ══════════════════════════════════════════════════════════════════
 # 排程器啟動
 # ══════════════════════════════════════════════════════════════════
@@ -722,33 +751,6 @@ async def get_log():
     return auto_state["log"]
 
 # ── 帳戶餘額 ──────────────────────────────────────────────────────
-def _refresh_capital_from_account():
-    """內部函式：從永豐真實帳戶刷新可用資金（扣除T+2交割款），供API端點與排程器共用，
-    確保即使前端沒開著，後端排程也會定期自己刷新，不會用過時的資金數字下單"""
-    if not sinopac_api: return None
-    try:
-        bal=sinopac_api.account_balance()
-        balance=float(getattr(bal,"acc_balance",None) or getattr(bal,"balance",0))
-        avail  =float(getattr(bal,"available_balance",None) or getattr(bal,"available",0))
-        pending_settlement = 0.0
-        try:
-            setts = sinopac_api.settlements(stock_account)
-            today_str = tw_now().strftime("%Y-%m-%d")
-            for s in setts:
-                t_date = str(getattr(s,"t_date","") or getattr(s,"date",""))
-                if t_date and t_date >= today_str:
-                    pending_settlement += abs(float(s.amount))
-        except Exception as se:
-            logger.warning(f"無法取得交割資料，風控將以可用餘額為準（未扣交割款）: {se}")
-        available_after_settlement = max(0.0, avail - pending_settlement)
-        if available_after_settlement>0:
-            auto_state["capital"]=available_after_settlement
-        return {"account":str(stock_account),"balance":balance,"available":avail,
-                "pending_settlement":pending_settlement,
-                "available_after_settlement":available_after_settlement}
-    except Exception as e:
-        logger.warning(f"刷新可用資金失敗: {e}")
-        return None
 
 @app.get("/account")
 async def get_account():
