@@ -142,7 +142,9 @@ def calc_signal_py(prices: List[float], volumes: List[float]) -> Dict:
     up_trend  = ma5>ma20 and ma20>ma50
     down_trend= ma5<ma20 and ma20<ma50
     t=tw_now(); tm=t.hour*60+t.minute
-    bad_time  = tm<9*60+45 or (12*60<=tm<13*60)
+    # 與前端一致：09:00-09:30開盤亂流不進場、13:00後不開新倉，12:00-13:00午盤降權但不完全禁止
+    bad_time  = tm<9*60+30 or tm>=13*60
+    low_quality = 12*60<=tm<13*60
 
     bull=bear=0.0
     if rsi<25:bull+=20
@@ -183,6 +185,7 @@ def calc_signal_py(prices: List[float], volumes: List[float]) -> Dict:
     elif up_trend and bear>bull:bear*=0.70
     elif down_trend and bull>bear:bull*=0.70
     if bad_time:bull*=0.72;bear*=0.72
+    if low_quality:bull*=0.85;bear*=0.85
 
     total=bull+bear or 1
     bp=bull/total*100
@@ -302,21 +305,24 @@ def _log(msg:str, sym:str="系統"):
     auto_state["log"]=auto_state["log"][:100]
     logger.info(f"[Auto] {sym}: {msg}")
 
-def _snapshot(sym:str) -> Optional[float]:
+def _snapshot(sym:str) -> Optional[tuple]:
+    """回傳 (price, volume)，volume用真實成交量，不再用假數字（之前固定填1,000,000導致量比指標完全失效）"""
     if not sinopac_api: return None
     try:
         c=sinopac_api.Contracts.Stocks.get(sym)
         if not c: return None
         s=sinopac_api.snapshots([c])
-        return float(s[0].close) if s else None
+        if not s: return None
+        return (float(s[0].close), int(getattr(s[0],"total_volume",0) or 0))
     except: return None
 
 def _update_cache():
     for sym in auto_state["watchlist"]:
-        p=_snapshot(sym)
-        if p:
+        snap=_snapshot(sym)
+        if snap:
+            price,volume=snap
             if sym not in price_cache: price_cache[sym]=[]
-            price_cache[sym].append({"price":p,"volume":1_000_000})
+            price_cache[sym].append({"price":price,"volume":volume or 1_000_000})
             price_cache[sym]=price_cache[sym][-MAX_BARS:]
 
 def _reset_daily():
@@ -328,7 +334,7 @@ def _reset_daily():
 
 def _place_real_order(sym:str, action, qty:int):
     if auto_state.get("paper_mode"):
-        _log(f"📝模擬下單（未送出真實委託） {sym} {action} {qty}張",sym)
+        _log(f"[模擬]未送出真實委託 {sym} {action} {qty}張",sym)
         return
     if not sinopac_api or not stock_account: return
     try:
@@ -348,15 +354,16 @@ def auto_trade_tick():
     _update_cache()
     if auto_state["pause_until"]>time.time(): return
     if abs(min(0,auto_state["daily_pnl"]))/auto_state["capital"]*100>=3:
-        _log("⛔ 今日虧損達3%，停止交易"); return
+        _log("[停止]今日虧損達3%，停止交易"); return
     if auto_state["daily_pnl"]/auto_state["capital"]*100>=8:
-        _log("🔒 今日獲利達8%，鎖定獲利"); return
+        _log("[鎖定]今日獲利達8%，鎖定獲利"); return
     cfg=RISK_CFG[auto_state["risk"]]
     # 出場檢查
     to_close=[]
     for pos in auto_state["positions"]:
-        sym=pos["sym"]; p=_snapshot(sym)
-        if not p: continue
+        sym=pos["sym"]; snap=_snapshot(sym)
+        if not snap: continue
+        p=snap[0]
         pp=(p-pos["entry"])/pos["entry"]*100*(1 if pos["dir"]=="L" else -1)
         held_min=(time.time()-pos.get("opened_at",time.time()))/60
         time_up=held_min>=cfg.get("max_hold_min",40) and pp>-0.1  # 短炒持倉時間上限：超時且未明顯虧損就先了結
@@ -383,15 +390,15 @@ def auto_trade_tick():
                 if auto_state["consec_loss"]>=3:
                     auto_state["pause_until"]=time.time()+15*60
                     _log(f"連虧{auto_state['consec_loss']}次，冷靜15分鐘")
-            tag="✅止盈" if pp>=cfg["tp"] else "🔴停損" if pp<=-cfg["sl"] else "⏱️持倉超時" if time_up else "↩️反轉"
+            tag="止盈" if pp>=cfg["tp"] else "停損" if pp<=-cfg["sl"] else "持倉超時" if time_up else "反轉"
             _log(f"{tag} {pos['dir']} @{p:.2f} 淨損益${net_pnl:.0f}(毛利${gross:.0f}-成本${cost['total_cost']:.0f})",sym)
             # 漲跌停鎖死風險提示（不對稱）：做空遇漲停鎖死是真正危險（違約交割+借券費），
             # 做多遇跌停沖不掉則只是變成一般T+2持股，風險輕微，用不同等級的提示
             cinfo=get_contract_info(sym)
             if pos["dir"]=="S" and cinfo["limit_up"]>0 and p>=cinfo["limit_up"]*0.998:
-                _log(f"🚨 {sym} 接近/觸及漲停，做空回補可能掛不掉！可能產生借券費用與違約交割風險，請務必留意",sym)
+                _log(f"[高風險] {sym} 接近/觸及漲停，做空回補可能掛不掉，可能產生借券費用與違約交割風險",sym)
             if pos["dir"]=="L" and cinfo["limit_down"]>0 and p<=cinfo["limit_down"]*1.002:
-                _log(f"ℹ️ {sym} 接近/觸及跌停，今日可能無法賣出，將自動變成一般持股待T+2交割（非違約風險）",sym)
+                _log(f"[提示] {sym} 接近/觸及跌停，今日可能無法賣出，將自動變成一般持股待T+2交割（非違約風險）",sym)
             close_act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
             _place_real_order(sym,close_act,pos["qty"])
             to_close.append(sym)
@@ -449,8 +456,26 @@ def force_close_all():
     if not auto_state["positions"]: return
     _log(f"13:20 強制平倉 {len(auto_state['positions'])} 筆（當沖規則：禁止留倉過夜）")
     for pos in list(auto_state["positions"]):
+        sym=pos["sym"]
+        try:
+            hist=price_cache.get(sym,[])
+            p=hist[-1]["price"] if hist else pos["entry"]  # 拿不到最新價時退回進場價，避免崩潰但盡量準確記錄
+            shares=pos["qty"]*1000
+            gross=(p-pos["entry"])*shares*(1 if pos["dir"]=="L" else -1)
+            cost=calc_round_trip_cost(
+                pos["entry"] if pos["dir"]=="L" else p,
+                p if pos["dir"]=="L" else pos["entry"],
+                shares
+            )["total_cost"]
+            net_pnl=gross-cost
+            auto_state["daily_pnl"]+=net_pnl; auto_state["daily_trades"]+=1
+            if net_pnl>0: auto_state["daily_win"]+=1; auto_state["consec_loss"]=0
+            else: auto_state["consec_loss"]+=1
+            _log(f"[強制平倉] {pos['dir']} @{p:.2f} 淨損益${net_pnl:.0f}",sym)
+        except Exception as e:
+            logger.warning(f"強制平倉{sym}損益計算失敗（委託仍會送出）: {e}")
         act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
-        _place_real_order(pos["sym"],act,pos["qty"])
+        _place_real_order(sym,act,pos["qty"])
     auto_state["positions"]=[]
 
 def post_market_summary():
@@ -466,13 +491,14 @@ def ml_training_window():
 # ══════════════════════════════════════════════════════════════════
 scheduler=BackgroundScheduler(timezone='Asia/Taipei')
 scheduler.add_job(auto_trade_tick,    'interval',seconds=30,id='tick',replace_existing=True)
+scheduler.add_job(_refresh_capital_from_account, 'interval',minutes=5,id='capital_refresh',replace_existing=True) # 確保後端自己定期跟永豐核對真實可用資金，不依賴前端
 scheduler.add_job(pre_market_prep,    CronTrigger(hour=8, minute=0, day_of_week='mon-fri'),id='prep')
 scheduler.add_job(force_close_all,    CronTrigger(hour=13,minute=20,day_of_week='mon-fri'),id='force_close')
 scheduler.add_job(post_market_summary,CronTrigger(hour=14,minute=30,day_of_week='mon-fri'),id='post')
 scheduler.add_job(ml_training_window, CronTrigger(hour=21,minute=0, day_of_week='mon-fri'),id='ml')
 scheduler.add_job(update_institutional_cache, CronTrigger(hour=15,minute=30,day_of_week='mon-fri'),id='inst_flow') # 證交所約15:00後公布當日三大法人資料
 scheduler.start()
-logger.info("✅ TradeAI Pro 後端 v2.0 排程器啟動 — 台股時段自動交易就緒")
+logger.info("TradeAI Pro 後端 v2.0 排程器啟動 — 台股時段自動交易就緒")
 
 # ══════════════════════════════════════════════════════════════════
 # FastAPI 應用
@@ -587,7 +613,8 @@ async def auto_start(req:AutoStartRequest):
     auto_state["cap_pct"]=req.cap_pct
     auto_state["paper_mode"]=req.paper_mode
     if req.watchlist: auto_state["watchlist"]=req.watchlist
-    mode_label="📝模擬下單（真實股價，不花真錢）" if req.paper_mode else "🔴真實下單"
+    _bootstrap_price_cache()  # 用真實歷史K棒暖機，避免重啟後空等15分鐘、且與前端顯示的訊號不一致
+    mode_label="模擬下單（真實股價，不花真錢）" if req.paper_mode else "真實下單"
     _log(f"後端自動交易啟動 | {mode_label} | 風險:{req.risk} | 資金:{req.cap_pct}% | 自選股:{len(auto_state['watchlist'])}支")
     return {"success":True,"message":"後端自動交易已啟動","state":auto_state}
 
@@ -695,31 +722,40 @@ async def get_log():
     return auto_state["log"]
 
 # ── 帳戶餘額 ──────────────────────────────────────────────────────
-@app.get("/account")
-async def get_account():
-    if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
+def _refresh_capital_from_account():
+    """內部函式：從永豐真實帳戶刷新可用資金（扣除T+2交割款），供API端點與排程器共用，
+    確保即使前端沒開著，後端排程也會定期自己刷新，不會用過時的資金數字下單"""
+    if not sinopac_api: return None
     try:
         bal=sinopac_api.account_balance()
         balance=float(getattr(bal,"acc_balance",None) or getattr(bal,"balance",0))
         avail  =float(getattr(bal,"available_balance",None) or getattr(bal,"available",0))
-        # 計算扣除T+2交割款後的真正可用資金（當沖風控應以此為基準，而非帳戶總餘額）
         pending_settlement = 0.0
         try:
             setts = sinopac_api.settlements(stock_account)
             today_str = tw_now().strftime("%Y-%m-%d")
             for s in setts:
                 t_date = str(getattr(s,"t_date","") or getattr(s,"date",""))
-                if t_date and t_date >= today_str:  # 尚未交割（未來日期）的金額視為待扣交割款
+                if t_date and t_date >= today_str:
                     pending_settlement += abs(float(s.amount))
         except Exception as se:
             logger.warning(f"無法取得交割資料，風控將以可用餘額為準（未扣交割款）: {se}")
         available_after_settlement = max(0.0, avail - pending_settlement)
-        auto_state["capital"]=available_after_settlement if available_after_settlement>0 else auto_state["capital"]
+        if available_after_settlement>0:
+            auto_state["capital"]=available_after_settlement
         return {"account":str(stock_account),"balance":balance,"available":avail,
                 "pending_settlement":pending_settlement,
                 "available_after_settlement":available_after_settlement}
     except Exception as e:
-        raise HTTPException(status_code=500,detail=str(e))
+        logger.warning(f"刷新可用資金失敗: {e}")
+        return None
+
+@app.get("/account")
+async def get_account():
+    if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
+    result=_refresh_capital_from_account()
+    if result is None: raise HTTPException(status_code=500,detail="無法取得帳戶資訊")
+    return result
 
 # ── 持倉明細 ──────────────────────────────────────────────────────
 @app.get("/positions")
@@ -834,23 +870,21 @@ async def get_price(symbol:str):
 
 # ── 交割記錄 ──────────────────────────────────────────────────────
 # ── 真實歷史K棒（取代前端亂數模擬，讓RSI/MACD/ML訓練都基於真實價格歷史）──────
-@app.get("/history/{symbol}")
-async def get_history(symbol:str, bars:int=90):
-    if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
+def _fetch_real_history(symbol:str, bars:int=90):
+    """內部函式：抓真實歷史K棒，供API端點與後端自身的price_cache暖機共用"""
+    if not sinopac_api: return []
     symbol=symbol.replace(".TW","").replace(".TWO","")
     try:
         contract=sinopac_api.Contracts.Stocks.get(symbol)
-        if not contract: raise HTTPException(status_code=404,detail=f"找不到 {symbol}")
+        if not contract: return []
         end_d=tw_now()
-        start_d=end_d-timedelta(days=10)  # 抓近10天涵蓋週末，確保拿到最近一個交易日的資料
+        start_d=end_d-timedelta(days=10)
         kb=sinopac_api.kbars(contract,start=start_d.strftime("%Y-%m-%d"),end=end_d.strftime("%Y-%m-%d"))
-        if not kb or not kb.ts:
-            return {"symbol":symbol,"bars":[],"note":"無歷史資料（可能非交易日或新股）"}
+        if not kb or not kb.ts: return []
         n=len(kb.ts)
-        # 轉換並聚合成5分鐘K棒（kbars預設為1分鐘），取最近 bars*5 分鐘的資料
         raw=[{"ts":kb.ts[i],"open":kb.Open[i],"high":kb.High[i],"low":kb.Low[i],
               "close":kb.Close[i],"volume":kb.Volume[i]} for i in range(n)]
-        raw=raw[-(bars*5):]  # 1分鐘bar，取 bars*5 根換算成約 bars 根5分鐘bar
+        raw=raw[-(bars*5):]
         agg=[]
         for i in range(0,len(raw),5):
             chunk=raw[i:i+5]
@@ -858,17 +892,34 @@ async def get_history(symbol:str, bars:int=90):
             t=datetime.fromtimestamp(chunk[0]["ts"]/1e9,tz=TW_TZ)
             agg.append({
                 "time":t.strftime("%H:%M"),
-                "price":chunk[-1]["close"],
-                "close":chunk[-1]["close"],
+                "price":chunk[-1]["close"],"close":chunk[-1]["close"],
                 "open":chunk[0]["open"],
                 "high":max(c["high"] for c in chunk),
                 "low":min(c["low"] for c in chunk),
                 "volume":sum(c["volume"] for c in chunk),
             })
-        return {"symbol":symbol,"bars":agg[-bars:],"source":"real_kbars"}
-    except HTTPException: raise
+        return agg[-bars:]
     except Exception as e:
-        raise HTTPException(status_code=500,detail=f"取得歷史資料失敗：{str(e)}")
+        logger.warning(f"抓取{symbol}歷史K棒失敗: {e}")
+        return []
+
+def _bootstrap_price_cache():
+    """後端啟動自動交易時，用真實歷史K棒預先填充price_cache，避免重啟後要空等15分鐘才開始判斷信號
+    （這段空窗期內前端可能已經根據真實歷史顯示訊號，但後端因為price_cache是空的只會回報觀望，造成兩邊不一致）"""
+    for sym in auto_state["watchlist"]:
+        if sym in price_cache and len(price_cache[sym])>=30: continue
+        bars=_fetch_real_history(sym,bars=MAX_BARS)
+        if bars:
+            price_cache[sym]=[{"price":b["close"],"volume":b["volume"]} for b in bars]
+            logger.info(f"{sym} price_cache 已用真實歷史K棒暖機，{len(bars)}筆")
+
+@app.get("/history/{symbol}")
+async def get_history(symbol:str, bars:int=90):
+    if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
+    agg=_fetch_real_history(symbol,bars)
+    if not agg:
+        return {"symbol":symbol,"bars":[],"note":"無歷史資料（可能非交易日或新股）"}
+    return {"symbol":symbol,"bars":agg,"source":"real_kbars"}
 
 @app.get("/settlements")
 async def get_settlements():
