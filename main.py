@@ -202,7 +202,7 @@ stock_account  = None
 future_account = None
 
 auto_state = {
-    "enabled":False,"risk":"low","cap_pct":100,
+    "enabled":False,"risk":"low","cap_pct":100,"paper_mode":True,  # 預設模擬下單，須使用者明確選擇才會送真實委託
     "watchlist":[],"positions":[],"log":[],
     "capital":1_000_000,
     "daily_pnl":0.0,"daily_win":0,"daily_trades":0,
@@ -327,6 +327,9 @@ def _reset_daily():
         _log("每日計數器重置 ✓")
 
 def _place_real_order(sym:str, action, qty:int):
+    if auto_state.get("paper_mode"):
+        _log(f"📝模擬下單（未送出真實委託） {sym} {action} {qty}張",sym)
+        return
     if not sinopac_api or not stock_account: return
     try:
         c=sinopac_api.Contracts.Stocks.get(sym)
@@ -489,6 +492,7 @@ class CancelRequest(BaseModel):
 
 class AutoStartRequest(BaseModel):
     risk:str="low"; cap_pct:int=100; watchlist:List[str]=[]
+    paper_mode:bool=True  # True=模擬下單(用真實股價算損益但不送真實委託)，False=真實下單
 
 # ── 健康 ──────────────────────────────────────────────────────────
 @app.get("/")
@@ -511,6 +515,7 @@ def get_status():
         "market_open":ms["status"]=="open",
         "connected":sinopac_api is not None,
         "auto_enabled":auto_state["enabled"],
+        "paper_mode":auto_state.get("paper_mode",True),
         "daily_pnl":round(auto_state["daily_pnl"],0),
         "daily_pnl_pct":round(auto_state["daily_pnl"]/auto_state["capital"]*100,2),
         "win_rate":wr,
@@ -580,8 +585,10 @@ async def auto_start(req:AutoStartRequest):
     auto_state["enabled"]=True
     auto_state["risk"]=req.risk
     auto_state["cap_pct"]=req.cap_pct
+    auto_state["paper_mode"]=req.paper_mode
     if req.watchlist: auto_state["watchlist"]=req.watchlist
-    _log(f"後端自動交易啟動 | 風險:{req.risk} | 資金:{req.cap_pct}% | 自選股:{len(auto_state['watchlist'])}支")
+    mode_label="📝模擬下單（真實股價，不花真錢）" if req.paper_mode else "🔴真實下單"
+    _log(f"後端自動交易啟動 | {mode_label} | 風險:{req.risk} | 資金:{req.cap_pct}% | 自選股:{len(auto_state['watchlist'])}支")
     return {"success":True,"message":"後端自動交易已啟動","state":auto_state}
 
 @app.post("/auto/stop")
@@ -818,7 +825,7 @@ async def get_price(symbol:str):
         snap=sinopac_api.snapshots([contract])
         if not snap: raise HTTPException(status_code=404,detail="無法取得股價")
         s=snap[0]
-        return {"symbol":symbol,"price":float(s.close),"change":float(s.change_price),
+        return {"symbol":symbol,"name":str(getattr(contract,"name","")),"price":float(s.close),"change":float(s.change_price),
                 "change_percent":float(s.change_rate),"volume":int(s.total_volume),
                 "open":float(s.open),"high":float(s.high),"low":float(s.low)}
     except HTTPException: raise
