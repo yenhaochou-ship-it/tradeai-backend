@@ -10,6 +10,7 @@ import shioaji as sj
 import os, logging, base64, tempfile, time
 from datetime import datetime
 import pytz
+import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -209,14 +210,88 @@ auto_state = {
 }
 
 RISK_CFG = {
-    "low":  {"min_conf":72,"alloc":0.05,"sl":2.0,"tp":4.0,"max_pos":3},
-    "mid":  {"min_conf":68,"alloc":0.10,"sl":3.0,"tp":6.0,"max_pos":5},
-    "high": {"min_conf":65,"alloc":0.20,"sl":5.0,"tp":10.0,"max_pos":8},
+    "low":  {"min_conf":72,"alloc":0.05,"sl":2.0,"tp":4.0,"max_pos":3,"max_hold_min":25},
+    "mid":  {"min_conf":68,"alloc":0.10,"sl":3.0,"tp":6.0,"max_pos":5,"max_hold_min":40},
+    "high": {"min_conf":65,"alloc":0.20,"sl":5.0,"tp":10.0,"max_pos":8,"max_hold_min":60},
 }
 
 price_cache: Dict[str,List[Dict]] = {}
 MAX_BARS = 120
 ml_predictions: Dict[str,float] = {}  # {symbol: 0~1 預測勝率} 由前端訓練完成後同步
+
+# ── 個股合約資訊快取（當沖資格 day_trade、漲跌停價，每日更新一次，避免重複查詢）──
+contract_info_cache: Dict[str,Dict] = {}  # {symbol: {day_trade, limit_up, limit_down, cached_date}}
+
+def get_contract_info(symbol:str) -> dict:
+    """取得股票當沖資格與漲跌停價（真實資料，來自永豐合約），有快取避免重複查詢"""
+    today = tw_now().strftime("%Y%m%d")
+    cached = contract_info_cache.get(symbol)
+    if cached and cached.get("cached_date")==today:
+        return cached
+    info = {"day_trade":"Unknown","limit_up":0.0,"limit_down":0.0,"cached_date":today}
+    try:
+        contract = sinopac_api.Contracts.Stocks.get(symbol) if sinopac_api else None
+        if contract:
+            info["day_trade"] = str(getattr(contract,"day_trade",""))
+            info["limit_up"] = float(getattr(contract,"limit_up",0) or 0)
+            info["limit_down"] = float(getattr(contract,"limit_down",0) or 0)
+    except Exception as e:
+        logger.warning(f"取得{symbol}合約資訊失敗: {e}")
+    contract_info_cache[symbol]=info
+    return info
+
+def can_day_trade(symbol:str, is_sell_first:bool=False) -> tuple:
+    """檢查股票今日是否可當沖，回傳(可否,原因)。No=不可當沖(處置股票/零股/權證等)，OnlyBuy=僅限先買後賣"""
+    info = get_contract_info(symbol)
+    dt = info["day_trade"]
+    if "No" in dt: return (False, "今日不可當沖（處置股票或不符資格）")
+    if "OnlyBuy" in dt and is_sell_first: return (False, "今日僅限先買後賣，不可先賣後買")
+    return (True, "")
+
+# ══════════════════════════════════════════════════════════════════
+# 三大法人買賣超（真實公開資料，來源：台灣證交所開放資料 T86）
+# ══════════════════════════════════════════════════════════════════
+institutional_cache: Dict = {"date":None,"data":{}}  # {date, data:{symbol:{foreign,trust,dealer,total}}}
+
+def fetch_institutional_flows(date_str:str=None) -> Dict:
+    """從台灣證交所公開資料抓三大法人買賣超（真實數據，無需驗證）"""
+    if date_str is None:
+        date_str = tw_now().strftime("%Y%m%d")
+    try:
+        url = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={date_str}&selectType=ALL"
+        r = requests.get(url, timeout=10)
+        d = r.json()
+        if d.get("stat") != "OK" or not d.get("data"):
+            return {}
+        result = {}
+        for row in d["data"]:
+            try:
+                code = row[0].strip()
+                name = row[1].strip()
+                foreign_net = int(row[4].replace(",",""))   # 外資買賣超股數
+                trust_net   = int(row[10].replace(",",""))  # 投信買賣超股數
+                dealer_net  = int(row[11].replace(",",""))  # 自營商買賣超股數
+                result[code] = {
+                    "name": name,
+                    "foreign": foreign_net, "trust": trust_net, "dealer": dealer_net,
+                    "total": foreign_net+trust_net+dealer_net,
+                }
+            except (IndexError, ValueError):
+                continue
+        return result
+    except Exception as e:
+        logger.warning(f"抓取三大法人資料失敗: {e}")
+        return {}
+
+def update_institutional_cache():
+    today = tw_now().strftime("%Y%m%d")
+    if institutional_cache["date"] == today and institutional_cache["data"]:
+        return  # 今天已經抓過了
+    data = fetch_institutional_flows(today)
+    if data:
+        institutional_cache["date"] = today
+        institutional_cache["data"] = data
+        logger.info(f"三大法人資料已更新 | {len(data)}支股票 | {today}")
 
 # ══════════════════════════════════════════════════════════════════
 # 排程任務
@@ -280,7 +355,9 @@ def auto_trade_tick():
         sym=pos["sym"]; p=_snapshot(sym)
         if not p: continue
         pp=(p-pos["entry"])/pos["entry"]*100*(1 if pos["dir"]=="L" else -1)
-        close=pp<=-cfg["sl"] or pp>=cfg["tp"]
+        held_min=(time.time()-pos.get("opened_at",time.time()))/60
+        time_up=held_min>=cfg.get("max_hold_min",40) and pp>-0.1  # 短炒持倉時間上限：超時且未明顯虧損就先了結
+        close=pp<=-cfg["sl"] or pp>=cfg["tp"] or time_up
         if not close:
             hist=price_cache.get(sym,[])
             if len(hist)>=30:
@@ -289,11 +366,12 @@ def auto_trade_tick():
                    (pos["dir"]=="S" and sig["action"]=="buy"): close=True
         if close:
             # 計算真實淨損益（扣除手續費+當沖證交稅）
+            # 重要修正：pos["qty"] 是「張」數（1張=1000股），所有金額計算必須換算成股數，
+            # 否則損益會被低估1000倍，導致每日虧損/獲利風控門檻形同虛設
+            shares = pos["qty"] * 1000
             entry_p,exit_p = (pos["entry"],p) if pos["dir"]=="L" else (p,pos["entry"])
-            cost=calc_round_trip_cost(entry_p,exit_p,pos["qty"])
-            net_pnl=cost["net_pnl"] if pos["dir"]=="L" else -cost["gross_pnl"]-cost["total_cost"]
-            # 統一處理：做多淨利=賣-買-成本；做空淨利=(進場-出場)*qty-成本
-            gross=(p-pos["entry"])*pos["qty"]*(1 if pos["dir"]=="L" else -1)
+            cost=calc_round_trip_cost(entry_p,exit_p,shares)
+            gross=(p-pos["entry"])*shares*(1 if pos["dir"]=="L" else -1)
             net_pnl=gross-cost["total_cost"]
             auto_state["daily_pnl"]+=net_pnl; auto_state["daily_trades"]+=1
             if net_pnl>0: auto_state["daily_win"]+=1; auto_state["consec_loss"]=0
@@ -302,8 +380,15 @@ def auto_trade_tick():
                 if auto_state["consec_loss"]>=3:
                     auto_state["pause_until"]=time.time()+15*60
                     _log(f"連虧{auto_state['consec_loss']}次，冷靜15分鐘")
-            tag="✅止盈" if pp>=cfg["tp"] else "🔴停損" if pp<=-cfg["sl"] else "↩️反轉"
+            tag="✅止盈" if pp>=cfg["tp"] else "🔴停損" if pp<=-cfg["sl"] else "⏱️持倉超時" if time_up else "↩️反轉"
             _log(f"{tag} {pos['dir']} @{p:.2f} 淨損益${net_pnl:.0f}(毛利${gross:.0f}-成本${cost['total_cost']:.0f})",sym)
+            # 漲跌停鎖死風險提示（不對稱）：做空遇漲停鎖死是真正危險（違約交割+借券費），
+            # 做多遇跌停沖不掉則只是變成一般T+2持股，風險輕微，用不同等級的提示
+            cinfo=get_contract_info(sym)
+            if pos["dir"]=="S" and cinfo["limit_up"]>0 and p>=cinfo["limit_up"]*0.998:
+                _log(f"🚨 {sym} 接近/觸及漲停，做空回補可能掛不掉！可能產生借券費用與違約交割風險，請務必留意",sym)
+            if pos["dir"]=="L" and cinfo["limit_down"]>0 and p<=cinfo["limit_down"]*1.002:
+                _log(f"ℹ️ {sym} 接近/觸及跌停，今日可能無法賣出，將自動變成一般持股待T+2交割（非違約風險）",sym)
             close_act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
             _place_real_order(sym,close_act,pos["qty"])
             to_close.append(sym)
@@ -319,6 +404,19 @@ def auto_trade_tick():
         if len(hist)<30: continue
         sig=calc_signal_py([h["price"] for h in hist],[h["volume"] for h in hist])
         if sig["conf"]<cfg["min_conf"] or sig["action"]=="hold" or sig.get("bad_time"): continue
+        # 真實當沖資格檢查（用永豐合約真實資料：day_trade=No的處置股票/不符資格股票直接跳過）
+        dir_=  "L" if sig["action"]=="buy" else "S"
+        ok,reason = can_day_trade(sym, is_sell_first=(dir_=="S"))
+        if not ok:
+            continue  # 不符當沖資格，AI不會對此股票下單（避免送出必定失敗或違規的委託）
+        # 漲跌停鎖死風險（不對稱）：做空最怕遇到漲停鎖死買不回（會產生違約交割風險、借券費用），
+        # 做多遇到跌停沖不掉則只是變成一般T+2持股，風險相對輕微。故做空進場用更寬的安全距離。
+        cinfo=get_contract_info(sym)
+        p_now=hist[-1]["price"]
+        if dir_=="S" and cinfo["limit_up"]>0 and p_now>=cinfo["limit_up"]*0.985:
+            continue  # 做空：價格已偏向漲停（即使還沒鎖死），避免進場後被軋空鎖死買不回
+        if dir_=="L" and cinfo["limit_down"]>0 and p_now<=cinfo["limit_down"]*1.005:
+            continue  # 做多：價格已接近跌停，避免追空進場
         # ML 模型加成：若前端已訓練模型對此股有預測，納入信心參考（不足以單獨決定方向，僅加成/減弱）
         ml_pred=ml_predictions.get(sym)
         if ml_pred is not None:
@@ -328,12 +426,12 @@ def auto_trade_tick():
             if agree: sig["conf"]=min(95,sig["conf"]*1.08)  # ML同意方向，信心加成8%
         p=hist[-1]["price"]
         qty=max(1,int(auto_state["capital"]*(auto_state["cap_pct"]/100)*cfg["alloc"]/(p*1000)))
-        dir_="L" if sig["action"]=="buy" else "S"
         auto_state["positions"].append({
             "sym":sym,"dir":dir_,"qty":qty,"entry":p,
             "sl":round(p*(1-cfg["sl"]/100) if dir_=="L" else p*(1+cfg["sl"]/100),2),
             "tp":round(p*(1+cfg["tp"]/100) if dir_=="L" else p*(1-cfg["tp"]/100),2),
             "open_time":tw_now().strftime("%H:%M:%S"),
+            "opened_at":time.time(),  # 數值時間戳，用於計算持倉分鐘數（短炒持倉時間上限判斷）
         })
         act=sj.constant.Action.Buy if dir_=="L" else sj.constant.Action.Sell
         _place_real_order(sym,act,qty)
@@ -369,6 +467,7 @@ scheduler.add_job(pre_market_prep,    CronTrigger(hour=8, minute=0, day_of_week=
 scheduler.add_job(force_close_all,    CronTrigger(hour=13,minute=20,day_of_week='mon-fri'),id='force_close')
 scheduler.add_job(post_market_summary,CronTrigger(hour=14,minute=30,day_of_week='mon-fri'),id='post')
 scheduler.add_job(ml_training_window, CronTrigger(hour=21,minute=0, day_of_week='mon-fri'),id='ml')
+scheduler.add_job(update_institutional_cache, CronTrigger(hour=15,minute=30,day_of_week='mon-fri'),id='inst_flow') # 證交所約15:00後公布當日三大法人資料
 scheduler.start()
 logger.info("✅ TradeAI Pro 後端 v2.0 排程器啟動 — 台股時段自動交易就緒")
 
@@ -547,10 +646,42 @@ async def get_ml_model():
 async def calc_fees(entry_price:float,exit_price:float,qty:int=1000):
     return calc_round_trip_cost(entry_price,exit_price,qty)
 
+@app.get("/contract/{symbol}")
+async def get_contract_eligibility(symbol:str):
+    """查詢個股當沖資格與漲跌停價（真實永豐合約資料），供前端下單前提示風險"""
+    symbol=symbol.replace(".TW","").replace(".TWO","")
+    info=get_contract_info(symbol)
+    ok,reason=can_day_trade(symbol)
+    return {"symbol":symbol,"day_trade":info["day_trade"],"can_day_trade":ok,"reason":reason,
+            "limit_up":info["limit_up"],"limit_down":info["limit_down"]}
+
 @app.get("/fees/min-move")
 async def get_min_move():
     return {"min_profitable_move_pct":round(min_profitable_move_pct(),3),
             "note":"當沖一買一賣的價格漲跌幅至少要超過此百分比，才能扣除手續費與證交稅後真正獲利"}
+
+# ── 三大法人買賣超（真實公開資料）─────────────────────────────────────
+@app.get("/institutional/flows")
+async def get_institutional_flows(top:int=10):
+    """回傳今日外資/投信/自營商買賣超排行（依合計買賣超股數排序）"""
+    update_institutional_cache()  # 若快取是舊的會自動嘗試更新
+    data = institutional_cache["data"]
+    if not data:
+        return {"date":None,"top_buy":[],"top_sell":[],"note":"今日資料尚未公布（證交所約15:00後公布）或非交易日"}
+    sorted_items = sorted(data.items(), key=lambda x: x[1]["total"], reverse=True)
+    top_buy  = [{"symbol":k,**v} for k,v in sorted_items[:top] if v["total"]>0]
+    top_sell = [{"symbol":k,**v} for k,v in sorted_items[::-1][:top] if v["total"]<0]
+    return {"date":institutional_cache["date"],"top_buy":top_buy,"top_sell":top_sell}
+
+@app.get("/institutional/flows/{symbol}")
+async def get_institutional_flow_for_symbol(symbol:str):
+    """查詢特定股票的三大法人買賣超"""
+    update_institutional_cache()
+    symbol = symbol.replace(".TW","").replace(".TWO","")
+    data = institutional_cache["data"].get(symbol)
+    if not data:
+        return {"symbol":symbol,"found":False,"date":institutional_cache["date"]}
+    return {"symbol":symbol,"found":True,"date":institutional_cache["date"],**data}
 
 @app.get("/auto/log")
 async def get_log():
@@ -564,8 +695,22 @@ async def get_account():
         bal=sinopac_api.account_balance()
         balance=float(getattr(bal,"acc_balance",None) or getattr(bal,"balance",0))
         avail  =float(getattr(bal,"available_balance",None) or getattr(bal,"available",0))
-        auto_state["capital"]=balance if balance>0 else auto_state["capital"]
-        return {"account":str(stock_account),"balance":balance,"available":avail}
+        # 計算扣除T+2交割款後的真正可用資金（當沖風控應以此為基準，而非帳戶總餘額）
+        pending_settlement = 0.0
+        try:
+            setts = sinopac_api.settlements(stock_account)
+            today_str = tw_now().strftime("%Y-%m-%d")
+            for s in setts:
+                t_date = str(getattr(s,"t_date","") or getattr(s,"date",""))
+                if t_date and t_date >= today_str:  # 尚未交割（未來日期）的金額視為待扣交割款
+                    pending_settlement += abs(float(s.amount))
+        except Exception as se:
+            logger.warning(f"無法取得交割資料，風控將以可用餘額為準（未扣交割款）: {se}")
+        available_after_settlement = max(0.0, avail - pending_settlement)
+        auto_state["capital"]=available_after_settlement if available_after_settlement>0 else auto_state["capital"]
+        return {"account":str(stock_account),"balance":balance,"available":avail,
+                "pending_settlement":pending_settlement,
+                "available_after_settlement":available_after_settlement}
     except Exception as e:
         raise HTTPException(status_code=500,detail=str(e))
 
@@ -623,6 +768,20 @@ async def place_order(req:OrderRequest):
         contract=sinopac_api.Contracts.Stocks.get(req.symbol)
         if not contract: raise HTTPException(status_code=404,detail=f"找不到股票 {req.symbol}")
         action=sj.constant.Action.Buy if req.direction in ["做多","買進","buy"] else sj.constant.Action.Sell
+        # 真實當沖資格檢查（依永豐合約資料的 day_trade 欄位，Yes/No/OnlyBuy）
+        # 法規規定：零股、權證、ETN、處置股票皆不可當沖，僅整張可當沖（已用張為下單單位確保此規則）
+        day_trade_status = str(getattr(contract,"day_trade",""))
+        if "No" in day_trade_status:
+            raise HTTPException(status_code=400,detail=f"{req.symbol} 今日不可當沖（可能為處置股票或不符當沖資格），已阻止下單")
+        if "OnlyBuy" in day_trade_status and action==sj.constant.Action.Sell:
+            raise HTTPException(status_code=400,detail=f"{req.symbol} 今日僅限先買後賣（OnlyBuy），不可先賣後買，已阻止下單")
+        # 漲跌停鎖死風險檢查：若是做空（賣出）時遇漲停鎖死最危險（買不回會有違約交割+借券費風險）
+        limit_up=float(getattr(contract,"limit_up",0) or 0)
+        limit_down=float(getattr(contract,"limit_down",0) or 0)
+        if limit_up>0 and req.price>=limit_up*0.998:
+            logger.warning(f"{req.symbol} 接近漲停價({limit_up})，若為做空回補方向可能無法成交，請留意")
+        if limit_down>0 and req.price<=limit_down*1.002:
+            logger.warning(f"{req.symbol} 接近跌停價({limit_down})，若為做多賣出方向可能無法成交")
         ptype=sj.constant.StockPriceType.MKT if req.order_type=="市價" else sj.constant.StockPriceType.LMT
         order=sinopac_api.Order(price=req.price,quantity=req.quantity,action=action,
             price_type=ptype,order_type=sj.constant.OrderType.ROD,account=stock_account)
