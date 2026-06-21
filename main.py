@@ -2,7 +2,7 @@
 TradeAI Pro 後端 v2.0 — 24小時自動交易機器人
 台股時段：09:30-13:00主動交易 | 08:00盤前準備 | 13:00停開新倉 | 13:20強制平倉 | 14:30盤後總結
 """
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
@@ -233,6 +233,7 @@ def calc_signal_py(prices: List[float], volumes: List[float]) -> Dict:
     return {"action":action,"conf":round(conf,1),"rsi":round(rsi,1),
             "ma5":round(ma5,2),"ma20":round(ma20,2),"vwap":round(vwap,2),
             "williams_r":round(w_r,1),"cci":round(cci,1),"trend_str":round(trend_str,2),
+            "vol_ratio":round(vol_ratio,2),
             "bull":round(bull,1),"bear":round(bear,1),
             "up_trend":up_trend,"down_trend":down_trend,"bad_time":bad_time}
 
@@ -268,6 +269,17 @@ RISK_CFG = {
 price_cache: Dict[str,List[Dict]] = {}
 MAX_BARS = 120
 ml_predictions: Dict[str,float] = {}  # {symbol: 0~1 預測勝率} 由前端訓練完成後同步
+
+# ══════════════════════════════════════════════════════════════════
+# 全市場掃描股票池（0050成分股 + 主要流動性最好的台股，非使用者自選股）
+# 用於「飆股雷達」全市場掃描，跟使用者的自選股/真實交易清單(auto_state["watchlist"])完全分開
+# ══════════════════════════════════════════════════════════════════
+SCAN_UNIVERSE = [
+    "2330","2454","2308","2317","3711","2327","2303","2383","2891","3037",  # 0050前10大成分股
+    "2882","2886","2884","2881","2880","2885","2890","5880","2892","2887",  # 金融股
+    "2382","3008","2357","2379","4938","2345","2412","1301","1303","2002", # 科技/傳產龍頭
+    "3034","3045","2353","2356","6669","3661","3653","2474","2207","1216", # 其他大型股
+]
 
 # ── 個股合約資訊快取（當沖資格 day_trade、漲跌停價，每日更新一次，避免重複查詢）──
 contract_info_cache: Dict[str,Dict] = {}  # {symbol: {day_trade, limit_up, limit_down, cached_date}}
@@ -534,6 +546,48 @@ def post_market_summary():
 def ml_training_window():
     _log("21:00 ML訓練時段開始（前端訓練請在學習分頁執行）")
 
+# ══════════════════════════════════════════════════════════════════
+# 全市場飆股雷達：定期掃描SCAN_UNIVERSE，排序技術面動能最強的股票
+# 老實說明：這是技術指標排序，不是漲跌預測保證，已在前端文案標明
+# ══════════════════════════════════════════════════════════════════
+scan_cache = {"results": [], "updated": None, "scanning": False}
+
+def scan_top_stocks():
+    """掃描股票池，排出技術面動能最強的股票，含建議進出場點。排程定期執行，避免每次請求都要重新掃描40檔太慢"""
+    if not sinopac_api or scan_cache["scanning"]: return
+    if not is_trading_time(): return  # 非交易時段不掃描，避免浪費資源且資料無意義
+    scan_cache["scanning"] = True
+    results = []
+    try:
+        for sym in SCAN_UNIVERSE:
+            try:
+                bars = _fetch_real_history(sym, bars=90)
+                if len(bars) < 30: continue
+                prices = [b["close"] for b in bars]
+                volumes = [b["volume"] for b in bars]
+                sig = calc_signal_py(prices, volumes)
+                if sig["action"] == "hold": continue  # 觀望的不列入排行，只看有明確方向的
+                price = prices[-1]
+                momentum = (sig["conf"]-50)*1.0 + (sig.get("vol_ratio",1)-1)*15 + (sig.get("trend_str",0)*20)
+                # 建議進出場點（用中風險參數試算，僅供參考）
+                cfg = RISK_CFG["mid"]
+                is_long = sig["action"]=="buy"
+                sl = price*(1-cfg["sl"]/100) if is_long else price*(1+cfg["sl"]/100)
+                tp = price*(1+cfg["tp"]/100) if is_long else price*(1-cfg["tp"]/100)
+                results.append({
+                    "symbol": sym, "price": round(price,2), "action": sig["action"],
+                    "conf": sig["conf"], "rsi": sig["rsi"], "momentum": round(momentum,1),
+                    "entry": round(price,2), "stop_loss": round(sl,2), "take_profit": round(tp,2),
+                })
+            except Exception as e:
+                logger.warning(f"掃描{sym}失敗: {e}")
+        results.sort(key=lambda x: abs(x["momentum"]), reverse=True)
+        scan_cache["results"] = results[:10]  # 多存幾筆，前端可依需要取TOP5或更多
+        scan_cache["updated"] = tw_now().strftime("%H:%M:%S")
+        _log(f"全市場掃描完成，{len(results)}檔有明確信號（股票池共{len(SCAN_UNIVERSE)}檔）")
+    finally:
+        scan_cache["scanning"] = False
+
 def _periodic_persist():
     """定期把auto_state存進資料庫（不放在auto_trade_tick裡面，因為那個函式有很多提早return的分支，
     放在獨立排程更不容易漏掉某個情況沒存到）"""
@@ -574,6 +628,7 @@ def _refresh_capital_from_account():
 scheduler=BackgroundScheduler(timezone='Asia/Taipei')
 scheduler.add_job(auto_trade_tick,    'interval',seconds=30,id='tick',replace_existing=True)
 scheduler.add_job(_periodic_persist,  'interval',seconds=60,id='persist',replace_existing=True) # 每分鐘把auto_state存進資料庫
+scheduler.add_job(scan_top_stocks,    'interval',minutes=5,id='scan',replace_existing=True) # 每5分鐘掃描全市場股票池
 scheduler.add_job(_refresh_capital_from_account, 'interval',minutes=5,id='capital_refresh',replace_existing=True) # 確保後端自己定期跟永豐核對真實可用資金，不依賴前端
 scheduler.add_job(pre_market_prep,    CronTrigger(hour=8, minute=0, day_of_week='mon-fri'),id='prep')
 scheduler.add_job(force_close_all,    CronTrigger(hour=13,minute=20,day_of_week='mon-fri'),id='force_close')
@@ -638,7 +693,7 @@ def get_status():
 
 # ── 連接 / 斷線 ────────────────────────────────────────────────────
 @app.post("/connect")
-async def connect(req:ConnectRequest):
+async def connect(req:ConnectRequest, background_tasks:BackgroundTasks):
     global sinopac_api,stock_account,future_account
     try:
         api=sj.Shioaji(simulation=False)
@@ -668,6 +723,7 @@ async def connect(req:ConnectRequest):
             elif "future" in tn.lower() or "future" in at: future_account=acc
         if stock_account is None and accounts: stock_account=accounts[0]
         _log(f"永豐帳戶連接成功 CA={'✓' if ca_ok else '✗'}")
+        background_tasks.add_task(scan_top_stocks)  # 連線成功後立即在背景開始掃描，不用等5分鐘排程
         return {"success":True,"stock_account":str(stock_account) if stock_account else None,
                 "future_account":str(future_account) if future_account else None,
                 "total_accounts":len(accounts),"ca_activated":ca_ok}
@@ -803,6 +859,21 @@ async def get_institutional_flow_for_symbol(symbol:str):
     if not data:
         return {"symbol":symbol,"found":False,"date":institutional_cache["date"]}
     return {"symbol":symbol,"found":True,"date":institutional_cache["date"],**data}
+
+@app.get("/scan/topstocks")
+async def get_scan_results(top:int=5, background_tasks:BackgroundTasks=None):
+    """回傳全市場掃描結果（技術面動能排行，非預測保證）。若還沒掃描過會在背景觸發一次，不會卡住這次請求"""
+    if not sinopac_api:
+        raise HTTPException(status_code=401,detail="請先連接永豐帳戶")
+    if scan_cache["updated"] is None and not scan_cache["scanning"] and background_tasks is not None:
+        background_tasks.add_task(scan_top_stocks)  # 背景執行，不卡住這次API回應
+    return {
+        "results": scan_cache["results"][:top],
+        "updated": scan_cache["updated"],
+        "scanning": scan_cache["scanning"],
+        "universe_size": len(SCAN_UNIVERSE),
+        "note": "依RSI/MACD/量能/趨勢等技術指標綜合排序，反映目前技術面動能強度，非漲跌預測保證",
+    }
 
 @app.get("/auto/log")
 async def get_log():
