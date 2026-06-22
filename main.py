@@ -282,6 +282,19 @@ SCAN_UNIVERSE = [
     "3034","3045","2353","2356","6669","3661","3653","2474","2207","1216", # 其他大型股
 ]
 
+# 股票所屬板塊（用於進場時的板塊分散檢查，避免同一板塊集中持倉風險過高）
+SECTOR_MAP = {
+    "2330":"半導體","2303":"半導體",
+    "2454":"IC設計","2379":"IC設計","3034":"IC設計","3661":"IC設計",
+    "2308":"電源工業電子","3711":"封測","2327":"被動元件","2383":"PCB連接器","3037":"PCB",
+    "2317":"電子代工","2382":"電子代工","4938":"電子代工","2356":"電子代工","6669":"伺服器",
+    "2891":"金融","2882":"金融","2886":"金融","2884":"金融","2881":"金融",
+    "2880":"金融","2885":"金融","2890":"金融","5880":"金融","2892":"金融","2887":"金融",
+    "3008":"光學","2345":"網通設備","2412":"電信","3045":"電信",
+    "1301":"塑化","1303":"塑化","2002":"鋼鐵","2353":"筆電",
+    "3653":"散熱","2474":"機殼","2207":"汽車","1216":"食品",
+}
+
 # ── 個股合約資訊快取（當沖資格 day_trade、漲跌停價，每日更新一次，避免重複查詢）──
 contract_info_cache: Dict[str,Dict] = {}  # {symbol: {day_trade, limit_up, limit_down, cached_date}}
 
@@ -437,7 +450,15 @@ def auto_trade_tick():
         pp=(p-pos["entry"])/pos["entry"]*100*(1 if pos["dir"]=="L" else -1)
         held_min=(time.time()-pos.get("opened_at",time.time()))/60
         time_up=held_min>=cfg.get("max_hold_min",40) and pp>-0.1  # 短炒持倉時間上限：超時且未明顯虧損就先了結
-        close=pp<=-cfg["sl"] or pp>=cfg["tp"] or time_up
+        # 移動停利：獲利超過1.5%後啟動，停損價跟隨移動鎖定部分獲利（新倉只會是多單，但保留方向判斷以正確處理限制前就存在的舊空單）
+        if pp>=1.5:
+            if pos["dir"]=="L":
+                trail_sl=round(p*0.988,2)  # 距目前價1.2%
+                if trail_sl>pos["sl"]: pos["sl"]=trail_sl
+            else:
+                trail_sl=round(p*1.012,2)
+                if trail_sl<pos["sl"]: pos["sl"]=trail_sl
+        close=(p<=pos["sl"] if pos["dir"]=="L" else p>=pos["sl"]) or pp>=cfg["tp"] or time_up
         if not close:
             hist=price_cache.get(sym,[])
             if len(hist)>=30:
@@ -463,7 +484,10 @@ def auto_trade_tick():
             tag="止盈" if pp>=cfg["tp"] else "停損" if pp<=-cfg["sl"] else "持倉超時" if time_up else "反轉"
             _log(f"{tag} {pos['dir']} @{p:.2f} 淨損益${net_pnl:.0f}(毛利${gross:.0f}-成本${cost['total_cost']:.0f})",sym)
             auto_state["trade_history"].insert(0,{
-                "sym":sym,"dir":pos["dir"],"qty":pos["qty"],"entry":pos["entry"],"exit":round(p,2),
+                "sym":sym,"dir":pos["dir"],"qty":pos["qty"],"shares":shares,
+                "entry":pos["entry"],"exit":round(p,2),
+                "total_cost_basis":round(pos["entry"]*shares,0),  # 進場總成本（股數×進場價）
+                "gross_pnl":round(gross,0),"fees":round(cost["total_cost"],0),
                 "pnl":round(net_pnl,0),"pct":round(pp,2),"tag":tag,
                 "open_time":pos.get("open_time",""),"close_time":tw_now().strftime("%H:%M:%S"),
                 "from_pool": sym not in auto_state["watchlist"],
@@ -521,9 +545,13 @@ def auto_trade_tick():
 
     # 依AI預估利潤分數高低排序，分數最高的優先取得有限的持倉名額
     candidates.sort(key=lambda c:c["est_profit_score"],reverse=True)
+    held_sectors={SECTOR_MAP.get(p["sym"]) for p in auto_state["positions"] if SECTOR_MAP.get(p["sym"])}
     for c in candidates:
         if len(auto_state["positions"])>=cfg["max_pos"]: break
         sym,sig,dir_,p=c["sym"],c["sig"],c["dir"],c["price"]
+        # 板塊分散：同板塊已有持倉就跳過這個候選，避免集中壓在同一個產業（如同時押好幾家金融股）
+        this_sector=SECTOR_MAP.get(sym)
+        if this_sector and this_sector in held_sectors: continue
         qty=max(1,int(auto_state["capital"]*(auto_state["cap_pct"]/100)*cfg["alloc"]/(p*1000)))
         auto_state["positions"].append({
             "sym":sym,"dir":dir_,"qty":qty,"entry":p,
@@ -537,6 +565,7 @@ def auto_trade_tick():
         pool_tag="[股票池]" if (sym not in auto_state["watchlist"]) else ""
         _log(f"{pool_tag}{'做多▲' if dir_=='L' else '做空▼'} {qty}張@{p:.2f} 信心{sig['conf']:.0f}% 預估分數{c['est_profit_score']:.0f}",sym)
         existing.add(sym)
+        if this_sector: held_sectors.add(this_sector)
 
 def pre_market_prep():
     _reset_daily(); _update_cache()
@@ -564,7 +593,10 @@ def force_close_all():
             _log(f"[強制平倉] {pos['dir']} @{p:.2f} 淨損益${net_pnl:.0f}",sym)
             pp_fc=(p-pos["entry"])/pos["entry"]*100*(1 if pos["dir"]=="L" else -1)
             auto_state["trade_history"].insert(0,{
-                "sym":sym,"dir":pos["dir"],"qty":pos["qty"],"entry":pos["entry"],"exit":round(p,2),
+                "sym":sym,"dir":pos["dir"],"qty":pos["qty"],"shares":shares,
+                "entry":pos["entry"],"exit":round(p,2),
+                "total_cost_basis":round(pos["entry"]*shares,0),
+                "gross_pnl":round(gross,0),"fees":round(cost,0),
                 "pnl":round(net_pnl,0),"pct":round(pp_fc,2),"tag":"強制平倉",
                 "open_time":pos.get("open_time",""),"close_time":tw_now().strftime("%H:%M:%S"),
                 "from_pool": sym not in auto_state["watchlist"],
@@ -669,11 +701,11 @@ scheduler.add_job(auto_trade_tick,    'interval',seconds=30,id='tick',replace_ex
 scheduler.add_job(_periodic_persist,  'interval',seconds=60,id='persist',replace_existing=True) # 每分鐘把auto_state存進資料庫
 scheduler.add_job(scan_top_stocks,    'interval',minutes=5,id='scan',replace_existing=True) # 每5分鐘掃描全市場股票池
 scheduler.add_job(_refresh_capital_from_account, 'interval',minutes=5,id='capital_refresh',replace_existing=True) # 確保後端自己定期跟永豐核對真實可用資金，不依賴前端
-scheduler.add_job(pre_market_prep,    CronTrigger(hour=8, minute=0, day_of_week='mon-fri'),id='prep')
-scheduler.add_job(force_close_all,    CronTrigger(hour=13,minute=20,day_of_week='mon-fri'),id='force_close')
-scheduler.add_job(post_market_summary,CronTrigger(hour=14,minute=30,day_of_week='mon-fri'),id='post')
-scheduler.add_job(ml_training_window, CronTrigger(hour=21,minute=0, day_of_week='mon-fri'),id='ml')
-scheduler.add_job(update_institutional_cache, CronTrigger(hour=15,minute=30,day_of_week='mon-fri'),id='inst_flow') # 證交所約15:00後公布當日三大法人資料
+scheduler.add_job(pre_market_prep,    CronTrigger(hour=8, minute=0, day_of_week='mon-fri',timezone='Asia/Taipei'),id='prep')
+scheduler.add_job(force_close_all,    CronTrigger(hour=13,minute=20,day_of_week='mon-fri',timezone='Asia/Taipei'),id='force_close')
+scheduler.add_job(post_market_summary,CronTrigger(hour=14,minute=30,day_of_week='mon-fri',timezone='Asia/Taipei'),id='post')
+scheduler.add_job(ml_training_window, CronTrigger(hour=21,minute=0, day_of_week='mon-fri',timezone='Asia/Taipei'),id='ml')
+scheduler.add_job(update_institutional_cache, CronTrigger(hour=15,minute=30,day_of_week='mon-fri',timezone='Asia/Taipei'),id='inst_flow') # 證交所約15:00後公布當日三大法人資料
 scheduler.start()
 logger.info("TradeAI Pro 後端 v2.0 排程器啟動 — 台股時段自動交易就緒")
 
