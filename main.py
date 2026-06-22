@@ -246,10 +246,11 @@ future_account = None
 
 _auto_state_defaults = {
     "enabled":False,"risk":"low","cap_pct":100,"paper_mode":True,  # 預設模擬下單，須使用者明確選擇才會送真實委託
-    "watchlist":[],"positions":[],"log":[],
+    "watchlist":[],"positions":[],"log":[],"trade_history":[],  # trade_history: 每筆已完成交易的明細記錄
     "capital":1_000_000,
     "daily_pnl":0.0,"daily_win":0,"daily_trades":0,
     "consec_loss":0,"pause_until":0,"trade_date":None,
+    "_loss_stop_logged":False,"_profit_lock_logged":False,
 }
 auto_state = db_load("auto_state", None) or dict(_auto_state_defaults)
 # 資料庫存的舊資料可能缺少新版新增的欄位，補齊避免KeyError
@@ -376,7 +377,12 @@ def _snapshot(sym:str) -> Optional[tuple]:
     except: return None
 
 def _update_cache():
-    for sym in auto_state["watchlist"]:
+    # 模擬下單模式：除了使用者自選清單，也持續更新40檔股票池的價格快取，
+    # 因為模擬模式下AI可以從這個更大的股票池找當沖機會（真實下單仍只看使用者自選清單，較保守）
+    symbols = set(auto_state["watchlist"])
+    if auto_state.get("paper_mode"):
+        symbols |= set(SCAN_UNIVERSE)
+    for sym in symbols:
         snap=_snapshot(sym)
         if snap:
             price,volume=snap
@@ -388,7 +394,8 @@ def _reset_daily():
     today=tw_now().strftime("%Y-%m-%d")
     if auto_state["trade_date"]!=today:
         auto_state.update({"trade_date":today,"daily_pnl":0.0,
-            "daily_win":0,"daily_trades":0,"consec_loss":0,"pause_until":0})
+            "daily_win":0,"daily_trades":0,"consec_loss":0,"pause_until":0,
+            "_loss_stop_logged":False,"_profit_lock_logged":False,"trade_history":[]})
         _log("每日計數器重置 ✓")
 
 def _place_real_order(sym:str, action, qty:int):
@@ -413,9 +420,13 @@ def auto_trade_tick():
     _update_cache()
     if auto_state["pause_until"]>time.time(): return
     if abs(min(0,auto_state["daily_pnl"]))/auto_state["capital"]*100>=3:
-        _log("[停止]今日虧損達3%，停止交易"); return
+        if not auto_state.get("_loss_stop_logged"):
+            _log("[停止]今日虧損達3%，停止交易"); auto_state["_loss_stop_logged"]=True
+        return
     if auto_state["daily_pnl"]/auto_state["capital"]*100>=8:
-        _log("[鎖定]今日獲利達8%，鎖定獲利"); return
+        if not auto_state.get("_profit_lock_logged"):
+            _log("[鎖定]今日獲利達8%，鎖定獲利"); auto_state["_profit_lock_logged"]=True
+        return
     cfg=RISK_CFG[auto_state["risk"]]
     # 出場檢查
     to_close=[]
@@ -451,6 +462,13 @@ def auto_trade_tick():
                     _log(f"連虧{auto_state['consec_loss']}次，冷靜15分鐘")
             tag="止盈" if pp>=cfg["tp"] else "停損" if pp<=-cfg["sl"] else "持倉超時" if time_up else "反轉"
             _log(f"{tag} {pos['dir']} @{p:.2f} 淨損益${net_pnl:.0f}(毛利${gross:.0f}-成本${cost['total_cost']:.0f})",sym)
+            auto_state["trade_history"].insert(0,{
+                "sym":sym,"dir":pos["dir"],"qty":pos["qty"],"entry":pos["entry"],"exit":round(p,2),
+                "pnl":round(net_pnl,0),"pct":round(pp,2),"tag":tag,
+                "open_time":pos.get("open_time",""),"close_time":tw_now().strftime("%H:%M:%S"),
+                "from_pool": sym not in auto_state["watchlist"],
+            })
+            auto_state["trade_history"]=auto_state["trade_history"][:50]
             # 漲跌停鎖死風險提示（不對稱）：做空遇漲停鎖死是真正危險（違約交割+借券費），
             # 做多遇跌停沖不掉則只是變成一般T+2持股，風險輕微，用不同等級的提示
             cinfo=get_contract_info(sym)
@@ -465,27 +483,31 @@ def auto_trade_tick():
     # 開倉（僅在09:30-13:00主動交易時段，避開開盤亂流與尾盤風險）
     if not can_open_new_position():
         existing=set()
+        candidates_pool=[]
     else:
         existing={p["sym"] for p in auto_state["positions"]}
-    for sym in (auto_state["watchlist"] if can_open_new_position() else []):
-        if sym in existing or len(auto_state["positions"])>=cfg["max_pos"]: continue
+        # 模擬下單：從40檔股票池找機會；真實下單：僅限使用者自選清單（較保守，避免真錢自動擴大選股範圍）
+        candidates_pool=list(set(auto_state["watchlist"]) | set(SCAN_UNIVERSE)) if auto_state.get("paper_mode") else list(auto_state["watchlist"])
+
+    # 先逐一檢查資格、算出每檔的「AI預估利潤分數」，蒐集成候選清單
+    candidates=[]
+    for sym in candidates_pool:
+        if sym in existing: continue
         hist=price_cache.get(sym,[])
         if len(hist)<30: continue
         sig=calc_signal_py([h["price"] for h in hist],[h["volume"] for h in hist])
         if sig["conf"]<cfg["min_conf"] or sig["action"]=="hold" or sig.get("bad_time"): continue
+        if sig["action"]=="sell": continue  # 當沖只做多單（低買高賣），不自動做空，避免漲停鎖死違約交割風險
+        dir_="L"
         # 真實當沖資格檢查（用永豐合約真實資料：day_trade=No的處置股票/不符資格股票直接跳過）
-        dir_=  "L" if sig["action"]=="buy" else "S"
         ok,reason = can_day_trade(sym, is_sell_first=(dir_=="S"))
-        if not ok:
-            continue  # 不符當沖資格，AI不會對此股票下單（避免送出必定失敗或違規的委託）
+        if not ok: continue  # 不符當沖資格，AI不會對此股票下單（避免送出必定失敗或違規的委託）
         # 漲跌停鎖死風險（不對稱）：做空最怕遇到漲停鎖死買不回（會產生違約交割風險、借券費用），
         # 做多遇到跌停沖不掉則只是變成一般T+2持股，風險相對輕微。故做空進場用更寬的安全距離。
         cinfo=get_contract_info(sym)
         p_now=hist[-1]["price"]
-        if dir_=="S" and cinfo["limit_up"]>0 and p_now>=cinfo["limit_up"]*0.985:
-            continue  # 做空：價格已偏向漲停（即使還沒鎖死），避免進場後被軋空鎖死買不回
-        if dir_=="L" and cinfo["limit_down"]>0 and p_now<=cinfo["limit_down"]*1.005:
-            continue  # 做多：價格已接近跌停，避免追空進場
+        if dir_=="S" and cinfo["limit_up"]>0 and p_now>=cinfo["limit_up"]*0.985: continue
+        if dir_=="L" and cinfo["limit_down"]>0 and p_now<=cinfo["limit_down"]*1.005: continue
         # ML 模型加成：若前端已訓練模型對此股有預測，納入信心參考（不足以單獨決定方向，僅加成/減弱）
         ml_pred=ml_predictions.get(sym)
         if ml_pred is not None:
@@ -493,7 +515,15 @@ def auto_trade_tick():
             disagree = (ml_pred<=0.40 and sig["action"]=="buy") or (ml_pred>=0.60 and sig["action"]=="sell")
             if disagree: continue  # ML與技術指標方向衝突，跳過避免假信號
             if agree: sig["conf"]=min(95,sig["conf"]*1.08)  # ML同意方向，信心加成8%
-        p=hist[-1]["price"]
+        # AI預估利潤分數：信心度 x 停利幅度（反映「機率高、且幅度大」的綜合期望值，僅供排序，非保證）
+        est_profit_score = sig["conf"] * cfg["tp"]
+        candidates.append({"sym":sym,"sig":sig,"dir":dir_,"price":p_now,"est_profit_score":est_profit_score})
+
+    # 依AI預估利潤分數高低排序，分數最高的優先取得有限的持倉名額
+    candidates.sort(key=lambda c:c["est_profit_score"],reverse=True)
+    for c in candidates:
+        if len(auto_state["positions"])>=cfg["max_pos"]: break
+        sym,sig,dir_,p=c["sym"],c["sig"],c["dir"],c["price"]
         qty=max(1,int(auto_state["capital"]*(auto_state["cap_pct"]/100)*cfg["alloc"]/(p*1000)))
         auto_state["positions"].append({
             "sym":sym,"dir":dir_,"qty":qty,"entry":p,
@@ -504,7 +534,8 @@ def auto_trade_tick():
         })
         act=sj.constant.Action.Buy if dir_=="L" else sj.constant.Action.Sell
         _place_real_order(sym,act,qty)
-        _log(f"{'做多▲' if dir_=='L' else '做空▼'} {qty}張@{p:.2f} 信心{sig['conf']:.0f}%",sym)
+        pool_tag="[股票池]" if (sym not in auto_state["watchlist"]) else ""
+        _log(f"{pool_tag}{'做多▲' if dir_=='L' else '做空▼'} {qty}張@{p:.2f} 信心{sig['conf']:.0f}% 預估分數{c['est_profit_score']:.0f}",sym)
         existing.add(sym)
 
 def pre_market_prep():
@@ -531,6 +562,14 @@ def force_close_all():
             if net_pnl>0: auto_state["daily_win"]+=1; auto_state["consec_loss"]=0
             else: auto_state["consec_loss"]+=1
             _log(f"[強制平倉] {pos['dir']} @{p:.2f} 淨損益${net_pnl:.0f}",sym)
+            pp_fc=(p-pos["entry"])/pos["entry"]*100*(1 if pos["dir"]=="L" else -1)
+            auto_state["trade_history"].insert(0,{
+                "sym":sym,"dir":pos["dir"],"qty":pos["qty"],"entry":pos["entry"],"exit":round(p,2),
+                "pnl":round(net_pnl,0),"pct":round(pp_fc,2),"tag":"強制平倉",
+                "open_time":pos.get("open_time",""),"close_time":tw_now().strftime("%H:%M:%S"),
+                "from_pool": sym not in auto_state["watchlist"],
+            })
+            auto_state["trade_history"]=auto_state["trade_history"][:50]
         except Exception as e:
             logger.warning(f"強制平倉{sym}損益計算失敗（委託仍會送出）: {e}")
         act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
@@ -754,7 +793,7 @@ async def auto_start(req:AutoStartRequest):
     if req.watchlist: auto_state["watchlist"]=req.watchlist
     _bootstrap_price_cache()  # 用真實歷史K棒暖機，避免重啟後空等15分鐘、且與前端顯示的訊號不一致
     mode_label="模擬下單（真實股價，不花真錢）" if req.paper_mode else "真實下單"
-    _log(f"後端自動交易啟動 | {mode_label} | 風險:{req.risk} | 資金:{req.cap_pct}% | 自選股:{len(auto_state['watchlist'])}支")
+    _log(f"後端自動交易啟動 | {mode_label} | 風險:{req.risk} | 資金:{req.cap_pct}% | 自選股:{len(auto_state['watchlist'])}支 | 僅做多單")
     _persist_auto_state()
     return {"success":True,"message":"後端自動交易已啟動","state":auto_state}
 
@@ -1037,7 +1076,10 @@ def _fetch_real_history(symbol:str, bars:int=90):
 def _bootstrap_price_cache():
     """後端啟動自動交易時，用真實歷史K棒預先填充price_cache，避免重啟後要空等15分鐘才開始判斷信號
     （這段空窗期內前端可能已經根據真實歷史顯示訊號，但後端因為price_cache是空的只會回報觀望，造成兩邊不一致）"""
-    for sym in auto_state["watchlist"]:
+    symbols = set(auto_state["watchlist"])
+    if auto_state.get("paper_mode"):
+        symbols |= set(SCAN_UNIVERSE)  # 模擬模式：股票池也一起暖機，AI才能立即從更大範圍找機會
+    for sym in symbols:
         if sym in price_cache and len(price_cache[sym])>=30: continue
         bars=_fetch_real_history(sym,bars=MAX_BARS)
         if bars:
