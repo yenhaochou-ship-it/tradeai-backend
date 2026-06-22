@@ -804,6 +804,19 @@ async def auto_stop():
     _persist_auto_state()
     return {"success":True}
 
+@app.post("/auto/reset-daily")
+async def reset_daily_stats():
+    """手動清空今日損益/勝率/交易紀錄，從現在開始重新計算（不影響真實永豐帳戶，只清這個系統自己記錄的統計數字）"""
+    auto_state.update({
+        "daily_pnl":0.0,"daily_win":0,"daily_trades":0,
+        "consec_loss":0,"pause_until":0,
+        "_loss_stop_logged":False,"_profit_lock_logged":False,
+        "trade_history":[],
+    })
+    _log("使用者手動清空今日統計，重新開始記錄")
+    _persist_auto_state()
+    return {"success":True,"state":auto_state}
+
 @app.get("/auto/status")
 async def auto_status():
     return {**auto_state,"market":market_status(),
