@@ -331,7 +331,8 @@ def _bucket_closes(entries:List[Dict], bucket_seconds:int) -> List[float]:
 
 def multi_timeframe_direction(entries:List[Dict]) -> Dict:
     """用price_cache裡的時間戳，分桶聚合成近似1分/5分/15分收盤序列，檢查三個時間框架方向是否一致。
-    資料不足(例如剛啟動、還沒累積15分鐘的歷史)時對應框架回報unknown，不會擋掉交易，只是不納入加分。"""
+    資料不足(例如剛啟動、還沒累積15分鐘的歷史)時對應框架回報unknown，aligned_long/short會是None(不確定)，
+    不會被當成「自動算過關」——呼叫端要把None當成中性看待，不是當成True。"""
     m1,m5,m15=_bucket_closes(entries,60),_bucket_closes(entries,300),_bucket_closes(entries,900)
     def direction(closes,lookback):
         if len(closes)<lookback+1: return "unknown"
@@ -340,9 +341,13 @@ def multi_timeframe_direction(entries:List[Dict]) -> Dict:
         chg=(closes[-1]-base)/base
         return "bull" if chg>0.001 else "bear" if chg<-0.001 else "flat"
     d15,d5,d1=direction(m15,2),direction(m5,3),direction(m1,2)
+    def _aligned(forbidden):
+        knowns=[d for d in (d15,d5,d1) if d!="unknown"]
+        if not knowns: return None  # 完全沒資料可判斷，回傳None(不確定)，不要預設True或False
+        return all(d!=forbidden for d in knowns)
     return {"d15":d15,"d5":d5,"d1":d1,
-            "aligned_long": d15!="bear" and d5!="bear" and d1!="bear",
-            "aligned_short":d15!="bull" and d5!="bull" and d1!="bull"}
+            "aligned_long":_aligned("bear"),
+            "aligned_short":_aligned("bull")}
 
 def orb_range(entries:List[Dict], date_str:str) -> Optional[Dict]:
     """取得當天09:00~09:15開盤區間的高低點(ORB)。沒有當天時間戳資料(例如太晚才連線、price_cache還沒暖機到含這段)回傳None"""
@@ -385,20 +390,18 @@ def bid_ask_imbalance(entries: List[Dict]) -> Dict:
     return {"imbalance":round(sum(vals)/len(vals),3),"n":len(recent)}
 
 def approx_order_flow(entries: List[Dict]) -> Dict:
-    """用snapshot的tick_type(最近一筆成交是外盤買進/內盤賣出)＋每次輪詢的累計成交量增量，
-    近似估算Delta(買賣力道淨額)/CVD(累積Delta)。
+    """用snapshot的tick_type(最近一筆成交是外盤買進/內盤賣出)＋每筆紀錄本身的區間成交量(volume欄位，
+    現在統一是「這段期間的增量」，不是累計量——見_update_cache的修正)，近似估算Delta(買賣力道淨額)/CVD(累積Delta)。
     重要警示：這是「輪詢近似」，不是真正逐筆Delta——30秒之間發生的所有成交，我們只看得到
-    輪詢當下那一筆的方向，中間被吃掉的買賣力道完全看不到，所以這個值有偏差，只能當參考，
-    不是精確值。真正精確的Delta/CVD需要訂閱tick資料流逐筆累加，這裡沒有做(見下方說明)。"""
+    輪詢當下最後一筆的方向，中間被吃掉的買賣力道完全看不到，所以這個值有偏差，只能當參考，
+    不是精確值。真正精確的Delta/CVD需要訂閱tick資料流逐筆累加，這裡沒有做(見上方說明)。"""
     deltas=[]
-    for i in range(1,len(entries)):
-        prev,cur=entries[i-1],entries[i]
-        if cur.get("volume") is None or prev.get("volume") is None: continue
-        vol_inc=cur["volume"]-prev["volume"]
-        if vol_inc<=0: continue
-        tt=cur.get("tick_type",0)
+    for e in entries:
+        vol=e.get("volume")
+        if vol is None or vol<=0: continue
+        tt=e.get("tick_type",0)
         sign=1 if tt==1 else (-1 if tt==2 else 0)
-        deltas.append(sign*vol_inc)
+        deltas.append(sign*vol)
     if not deltas: return {"cvd":0,"delta_recent":0,"note":"無逐筆方向資料(僅輪詢近似，非精確值)"}
     return {"cvd":sum(deltas),"delta_recent":sum(deltas[-10:]),"note":"輪詢近似值，非精確逐筆Delta"}
 
@@ -423,8 +426,13 @@ def is_no_trade_zone(prices:List[float], volumes:List[float]) -> Tuple[bool,str]
         return True,"連續假日前收盤前時段"
     if now.weekday()==2 and 15<=now.day<=21:  # 每月第三個星期三＝台指期/選擇權結算日
         return True,"月結算日"
-    if len(volumes)>=20 and sum(volumes[-20:])/20<200_000:
-        return True,"成交量過低"
+    if len(volumes)>=60:
+        recent20=sum(volumes[-20:])/20
+        baseline60=sum(volumes[-60:])/60
+        if baseline60>0 and recent20/baseline60<0.3:
+            return True,"成交量過低(相對近期明顯萎縮)"
+    elif len(volumes)>=20 and sum(volumes[-20:])==0:
+        return True,"成交量過低(完全無交易)"
     if len(prices)>=20:
         rets=[(prices[i]-prices[i-1])/prices[i-1] for i in range(1,len(prices)) if prices[i-1]]
         recent=rets[-20:]
@@ -454,7 +462,7 @@ def advanced_score(sym:str, prices:List[float], volumes:List[float], dir_:str) -
 
     regime_score = 100 if regime["regime"] in ("trending_bull","trending_bear") else (40 if regime["regime"]=="range" else 0)
     mtf_ok = mtf["aligned_long"] if dir_=="L" else mtf["aligned_short"]
-    mtf_score = 100 if mtf_ok else 30
+    mtf_score = 100 if mtf_ok is True else (30 if mtf_ok is False else 55)  # None=資料不足，給中性分數，不當成過關也不當成沒過關
     vwap_score = 100 if vwap_ok else 0
     orb_breakout = orb is not None and ((dir_=="L" and prices[-1]>orb["high"]) or (dir_=="S" and prices[-1]<orb["low"]))
     orb_score = 100 if orb_breakout else 40
@@ -536,6 +544,7 @@ def _paper_validation_progress() -> dict:
             "min_days":PAPER_VALIDATION_MIN_DAYS,"ready_for_real":ok}
 
 price_cache: Dict[str,List[Dict]] = {}
+_last_cum_volume: Dict[str,int] = {}  # 修正：追蹤每檔股票上次輪詢時的累計成交量，用來換算成「這次輪詢期間」的增量
 MAX_BARS = 120
 ml_predictions: Dict[str,float] = {}  # {symbol: 0~1 預測勝率} 由前端訓練完成後同步
 
@@ -684,8 +693,19 @@ def _update_cache():
     for sym in symbols:
         snap=_snapshot(sym)
         if snap:
+            cum_vol=snap["volume"]  # snapshot的volume其實是「今天累計成交量」(total_volume)，不是這次輪詢期間的量
+            prev_cum=_last_cum_volume.get(sym)
+            # 修正：bootstrap歷史K棒存的是「每根棒子的成交量」(區間量)，但這裡原本直接存累計量，
+            # 兩種語意混在同一個volume欄位裡，導致vol_ratio/量能指標在即時交易階段幾乎完全失真
+            # (累計量逐筆輪詢時彼此非常接近，比值永遠趨近1，偵測不到真正的爆量)。
+            # 改成：用累計量前後差，換算出「這次輪詢期間」真正成交的量，跟bootstrap的語意一致。
+            if prev_cum is None or cum_vol<prev_cum:
+                interval_vol=0  # 第一次輪詢這支股票，或跨日累計量重置：沒有基準可以算增量，給0避免單筆假爆量
+            else:
+                interval_vol=cum_vol-prev_cum
+            _last_cum_volume[sym]=cum_vol
             if sym not in price_cache: price_cache[sym]=[]
-            price_cache[sym].append({"price":snap["price"],"volume":snap["volume"] or 1_000_000,"t":time.time(),
+            price_cache[sym].append({"price":snap["price"],"volume":interval_vol,"t":time.time(),
                                       "buy_vol":snap["buy_vol"],"sell_vol":snap["sell_vol"],"tick_type":snap["tick_type"]})
             price_cache[sym]=price_cache[sym][-MAX_BARS:]
 
@@ -1209,7 +1229,7 @@ async def reset_daily_stats():
     auto_state.update({
         "daily_pnl":0.0,"daily_win":0,"daily_trades":0,
         "consec_loss":0,"pause_until":0,
-        "_loss_stop_logged":False,"_profit_lock_logged":False,
+        "_loss_stop_logged":False,"_profit_lock_logged":False,"_afford_warn_logged":False,
         "trade_history":[],
     })
     _log("使用者手動清空今日統計，重新開始記錄")
@@ -1229,6 +1249,7 @@ async def get_paper_validation():
 @app.put("/auto/watchlist")
 async def update_watchlist(watchlist:List[str]):
     auto_state["watchlist"]=watchlist
+    _persist_auto_state()
     return {"success":True,"watchlist":watchlist}
 
 # ── ML 模型預測同步（前端訓練完成後呼叫，讓後端下單邏輯參考ML判斷）──────
