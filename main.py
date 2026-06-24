@@ -844,6 +844,34 @@ def _paper_validation_progress() -> dict:
             "total_pnl":round(total_win+total_loss,0)}
 
 price_cache: Dict[str,List[Dict]] = {}
+# ══════════════════════════════════════════════════════════════════
+# 看門狗：Shioaji官方自己的參考交易終端機文件寫得很清楚——
+# 「停損/停利為客戶端觸價單，只在頁面開啟時監控」，沒有真正的券商/交易所端OCO或觸價單給股票用。
+# 也就是說，這支程式現在做的事(伺服器端輪詢價格、碰到條件就送出真實委託)就是業界唯一的標準做法，
+# 不是少了什麼「雲端智慧單」可以接。真正的風險不是「沒有券商端保護」，是「萬一我自己這個監控
+# 程式卡住/斷線了，停損停利就不會被執行」——這個才是看門狗該解決的問題。
+# ══════════════════════════════════════════════════════════════════
+_watchdog_state={"last_tick_at":time.time(),"alerted":False}
+WATCHDOG_THRESHOLD_SECONDS=90  # 連續3次30秒心跳沒更新(=90秒)就視為主迴圈可能卡住
+
+def watchdog_check():
+    """獨立排程，每30秒檢查一次auto_trade_tick有沒有按時跳動。只負責「警示」，不自動砍倉——
+    用時間落差判斷「主迴圈是不是卡住」本身就有誤判風險(網路一次延遲就可能誤觸發)，
+    強制砍倉這種有實際後果的動作，留給人看到警示後自己判斷，不要讓看門狗自己先動手。"""
+    if not auto_state["enabled"] or not is_trading_time():
+        _watchdog_state["alerted"]=False
+        return
+    gap=time.time()-_watchdog_state["last_tick_at"]
+    if gap>WATCHDOG_THRESHOLD_SECONDS:
+        if not _watchdog_state["alerted"]:
+            _log(f"⚠️⚠️⚠️ [看門狗警示] 主交易迴圈已經{gap:.0f}秒沒有心跳(正常應該30秒一次)，"
+                 f"可能已經停止監控停損停利！目前{'有' if auto_state['positions'] else '沒有'}持倉，"
+                 f"請立刻檢查伺服器狀態，必要時手動到永豐app/網頁平倉。")
+            _watchdog_state["alerted"]=True
+    else:
+        _watchdog_state["alerted"]=False
+
+
 _last_cum_volume: Dict[str,int] = {}  # 修正：追蹤每檔股票上次輪詢時的累計成交量，用來換算成「這次輪詢期間」的增量
 MAX_BARS = 120
 ml_predictions: Dict[str,float] = {}  # {symbol: 0~1 預測勝率} 由前端訓練完成後同步
@@ -1037,6 +1065,7 @@ def _place_real_order(sym:str, action, qty:int):
 
 def auto_trade_tick():
     """每30秒執行 — 核心自動交易"""
+    _watchdog_state["last_tick_at"]=time.time()  # 安全機制：記錄心跳，下面不管哪個分支return都已經記過了
     if not auto_state["enabled"] or not sinopac_api or not is_trading_time(): return
     _reset_daily()
     _update_cache()
@@ -1377,6 +1406,7 @@ def _refresh_capital_from_account():
 # ══════════════════════════════════════════════════════════════════
 scheduler=BackgroundScheduler(timezone='Asia/Taipei')
 scheduler.add_job(auto_trade_tick,    'interval',seconds=30,id='tick',replace_existing=True)
+scheduler.add_job(watchdog_check,     'interval',seconds=30,id='watchdog',replace_existing=True)
 scheduler.add_job(_periodic_persist,  'interval',seconds=60,id='persist',replace_existing=True) # 每分鐘把auto_state存進資料庫
 scheduler.add_job(scan_top_stocks,    'interval',minutes=5,id='scan',replace_existing=True) # 每5分鐘掃描全市場股票池
 scheduler.add_job(_refresh_capital_from_account, 'interval',minutes=5,id='capital_refresh',replace_existing=True) # 確保後端自己定期跟永豐核對真實可用資金，不依賴前端
@@ -1567,7 +1597,9 @@ async def reset_daily_stats():
 @app.get("/auto/status")
 async def auto_status():
     return {**auto_state,"market":market_status(),
-            "price_cache_size":{k:len(v) for k,v in price_cache.items()}}
+            "price_cache_size":{k:len(v) for k,v in price_cache.items()},
+            "watchdog":{"seconds_since_tick":round(time.time()-_watchdog_state["last_tick_at"],1),
+                        "alerted":_watchdog_state["alerted"]}}
 
 @app.get("/auto/validation")
 async def get_paper_validation():
