@@ -484,23 +484,17 @@ def advanced_score(sym:str, prices:List[float], volumes:List[float], dir_:str) -
             "mtf":mtf,"orb_breakout":orb_breakout,"volume_quality":vq,
             "order_flow":of,"fake_breakout_risk":absorb["fake_breakout_risk"]}
 
-def build_entry_reason(sig:Dict, adv:Dict, dir_:str) -> str:
-    """把進場當下實際成立的條件組成一句人看得懂的話，存進trade_history，
+def build_entry_reason(lgbm_conf:float, adv:Dict, dir_:str) -> str:
+    """把進場當下的LightGBM預測+輔助資訊組成一句人看得懂的話，存進trade_history，
     讓使用者不用回頭翻log或猜，直接在前端看到「為什麼這筆會被買進」。"""
-    parts=[f"技術信心{sig['conf']:.0f}%"]
+    parts=[f"LightGBM模型預測做多勝率{lgbm_conf:.0f}%"]
     if adv["vwap_ok"]: parts.append("VWAP上方" if dir_=="L" else "VWAP下方")
-    if adv["orb_breakout"]: parts.append("突破開盤區間高點" if dir_=="L" else "跌破開盤區間低點")
     if adv["regime"] in ("trending_bull","trending_bear"):
         parts.append(REGIME_LABEL_ZH.get(adv["regime"],adv["regime"]))
+    if adv["orb_breakout"]: parts.append("突破開盤區間高點" if dir_=="L" else "跌破開盤區間低點")
     vq=adv.get("volume_quality",{})
     if vq.get("score",0)>=70: parts.append(f"量能佳({vq['score']:.0f}分)")
-    of=adv.get("order_flow",{})
-    delta=of.get("delta_recent",0)
-    if (dir_=="L" and delta>0) or (dir_=="S" and delta<0): parts.append("買賣力道方向一致")
-    mtf=adv.get("mtf",{})
-    aligned=mtf.get("aligned_long") if dir_=="L" else mtf.get("aligned_short")
-    if aligned is True: parts.append("多時間框架方向一致")
-    parts.append(f"綜合評分{adv['total']:.0f}分({adv['grade']}級)")
+    parts.append(f"{lgbm_grade(lgbm_conf)}級")
     return "、".join(parts)
 
 def build_exit_reason(tag:str, cfg:Dict, held_min:float, pp:float) -> str:
@@ -513,6 +507,104 @@ def build_exit_reason(tag:str, cfg:Dict, held_min:float, pp:float) -> str:
     return tag
 
 REGIME_LABEL_ZH={"trending_bull":"多頭趨勢","trending_bear":"空頭趨勢","range":"區間盤整","volatile":"高波動","panic":"恐慌"}
+
+# ══════════════════════════════════════════════════════════════════
+# LightGBM 進場模型：取代原本的「12項技術指標綜合評分」與「進階評分(C級)」做為進場判斷主力。
+# 風控（國定假日/處置股/當日3筆上限/VWAP之上）維持獨立硬性檢查，不受模型影響。
+#
+# 重要：extract_ml_features() 的特徵定義/順序，train_lgbm_model.py 訓練腳本必須完全一致，
+# 否則訓練出來的模型在這裡推論時，餵進去的數字意義會對不上，預測值會是垂圾——
+# 兩邊都用同一份 ML_FEATURE_NAMES 常數核對順序，新增/刪除特徵時兩邊要一起改。
+# ══════════════════════════════════════════════════════════════════
+ML_FEATURE_NAMES=[
+    "rsi","williams_r","cci","trend_str","vol_ratio",
+    "ma5_ma20_dev_pct","price_vwap_dev_pct",
+    "regime_code","mtf_aligned_code",
+    "volume_quality_score","bid_ask_imbalance","order_flow_delta_scaled","orb_breakout",
+]
+_REGIME_CODE={"trending_bull":2,"trending_bear":-2,"range":0,"volatile":1,"panic":-3,"unknown":0}
+
+def extract_ml_features(sym:str, prices:List[float], volumes:List[float], dir_:str="L") -> Optional[List[float]]:
+    """把已經算好的技術指標/Phase1-2引擎輸出，統一抽成固定順序的特徵向量餵給LightGBM模型。
+    回傳None代表資料不足，呼叫端應該跳過這個候選，不要硬塞進模型。"""
+    if len(prices)<30: return None
+    sig=calc_signal_py(prices,volumes)
+    if sig.get("rsi") is None: return None
+    regime=classify_market_regime(prices)
+    entries=price_cache.get(sym,[])
+    mtf=multi_timeframe_direction(entries)
+    vq=volume_quality_score(volumes,entries)
+    of=approx_order_flow(entries)
+    orb=orb_range(entries,tw_now().strftime("%Y-%m-%d"))
+
+    ma20=sig.get("ma20") or 1
+    vwap=sig.get("vwap") or 1
+    aligned=mtf.get("aligned_long") if dir_=="L" else mtf.get("aligned_short")
+    mtf_code=1 if aligned is True else(-1 if aligned is False else 0)
+    orb_hit=1 if(orb is not None and prices[-1]>orb["high"] and dir_=="L") or \
+                 (orb is not None and prices[-1]<orb["low"] and dir_=="S") else 0
+
+    return [
+        sig.get("rsi",50), sig.get("williams_r",-50), sig.get("cci",0),
+        sig.get("trend_str",0), sig.get("vol_ratio",1),
+        (sig.get("ma5",ma20)/ma20-1)*100 if ma20 else 0,
+        (prices[-1]/vwap-1)*100 if vwap else 0,
+        _REGIME_CODE.get(regime["regime"],0), mtf_code,
+        vq.get("score",50), vq.get("bid_ask_imbalance",0),
+        of.get("delta_recent",0)/1000.0, orb_hit,
+    ]
+
+_lgbm_model={"booster":None,"loaded":False,"path":None,"error":None}
+LGBM_MODEL_PATH=os.environ.get("LGBM_MODEL_PATH","lgbm_model.txt")
+
+def _load_lgbm_model():
+    """惰性載入模型(第一次用到時才載入)，且把lightgbm的import包在function裡面而不是放在檔案最上面——
+    這樣即使尚未在requirements.txt加上lightgbm套件、或還沒訓練出模型檔案，整個後端服務照樣能正常啟動，
+    只是LightGBM進場判斷會自然停用(predict_lgbm_confidence回傳None)，不會讓整個API掛掉。"""
+    if _lgbm_model["loaded"]: return _lgbm_model["booster"]
+    _lgbm_model["loaded"]=True
+    if not os.path.exists(LGBM_MODEL_PATH):
+        _lgbm_model["error"]=f"模型檔案不存在: {LGBM_MODEL_PATH}（請先用 train_lgbm_model.py 訓練並放到這個路徑）"
+        logger.warning(f"⚠️ LightGBM{_lgbm_model['error']}")
+        return None
+    try:
+        import lightgbm as lgb
+        _lgbm_model["booster"]=lgb.Booster(model_file=LGBM_MODEL_PATH)
+        _lgbm_model["path"]=LGBM_MODEL_PATH
+        logger.info(f"✅ LightGBM模型已載入：{LGBM_MODEL_PATH}")
+    except ImportError:
+        _lgbm_model["error"]="lightgbm套件未安裝（requirements.txt需加上lightgbm並重新部署）"
+        logger.warning(f"⚠️ {_lgbm_model['error']}")
+    except Exception as e:
+        _lgbm_model["error"]=f"模型載入失敗: {e}"
+        logger.warning(f"⚠️ LightGBM{_lgbm_model['error']}")
+    return _lgbm_model["booster"]
+
+def predict_lgbm_confidence(sym:str, prices:List[float], volumes:List[float], dir_:str="L") -> Optional[float]:
+    """回傳LightGBM模型預測的「做多勝率信心度」(0~100)。模型不存在/特徵不足/預測失敗都回傳None，
+    呼叫端看到None就該跳過該候選——不會也不該悄悄退回舊的規則式評分，那樣等於沒有真的換掉。"""
+    booster=_load_lgbm_model()
+    if booster is None: return None
+    feats=extract_ml_features(sym,prices,volumes,dir_)
+    if feats is None: return None
+    try:
+        prob=booster.predict([feats])[0]
+        return float(max(0.0,min(100.0,prob*100)))
+    except Exception as e:
+        logger.warning(f"LightGBM預測失敗 {sym}: {e}")
+        return None
+
+def lgbm_grade(conf:float) -> str:
+    """沿用原本S/A/B/C分級的精神(信心越高部位越大)，改成依LightGBM信心度分級。
+    90/83/77這幾個門檻是合理起點，沒有校準過，建議拿真實預測結果回頭驗證調整。"""
+    if conf>=90: return "S"
+    if conf>=83: return "A"
+    if conf>=77: return "B"
+    return "C"
+
+def lgbm_size_multiplier(conf:float) -> float:
+    g=lgbm_grade(conf)
+    return {"S":1.0,"A":0.75,"B":0.5,"C":0.25}[g]
 
 # ══════════════════════════════════════════════════════════════════
 # 全域狀態
@@ -872,40 +964,35 @@ def auto_trade_tick():
         hist=price_cache.get(sym,[])
         if len(hist)<30: continue
         prices_h=[h["price"] for h in hist]; vols_h=[h["volume"] for h in hist]
+        # 修正⑩：進場判斷主力換成LightGBM模型——sig還是要算，但只用bad_time(開盤前30分/收盤前)
+        # 這個時間風控欄位，不再用sig['conf']/sig['action']決定要不要進場(那是被取代的"12項指標綜合評分")
         sig=calc_signal_py(prices_h,vols_h)
-        if sig["conf"]<cfg["min_conf"] or sig["action"]=="hold" or sig.get("bad_time"): continue
-        if sig["action"]=="sell": continue  # 當沖只做多單（低買高賣），不自動做空，避免漲停鎖死違約交割風險
-        dir_="L"
-        # 禁止交易區：國定假日/連續假日前收盤前/月結算日/量過低/波動度過低，這些情況下不進場
+        if sig.get("bad_time"): continue
+        dir_="L"  # 規格要求：只看LightGBM「做多勝率」，當沖只做多單
+        # 禁止交易區：國定假日/連續假日前收盤前/月結算日/量過低/波動度過低，這些情況下不進場(維持獨立硬性檢查)
         ntz,ntz_reason=is_no_trade_zone(prices_h,vols_h)
         if ntz: continue
-        # 真實當沖資格檢查（用永豐合約真實資料：day_trade=No的處置股票/不符資格股票直接跳過）
-        ok,reason = can_day_trade(sym, is_sell_first=(dir_=="S"))
-        if not ok: continue  # 不符當沖資格，AI不會對此股票下單（避免送出必定失敗或違規的委託）
-        # 漲跌停鎖死風險（不對稱）：做空最怕遇到漲停鎖死買不回（會產生違約交割風險、借券費用），
-        # 做多遇到跌停沖不掉則只是變成一般T+2持股，風險相對輕微。故做空進場用更寬的安全距離。
+        # 真實當沖資格檢查（用永豐合約真實資料：day_trade=No的處置股票/不符資格股票直接跳過，維持獨立硬性檢查）
+        ok,reason = can_day_trade(sym, is_sell_first=False)
+        if not ok: continue
         cinfo=get_contract_info(sym)
         p_now=hist[-1]["price"]
-        if dir_=="S" and cinfo["limit_up"]>0 and p_now>=cinfo["limit_up"]*0.985: continue
-        if dir_=="L" and cinfo["limit_down"]>0 and p_now<=cinfo["limit_down"]*1.005: continue
-        # ML 模型加成：若前端已訓練模型對此股有預測，納入信心參考（不足以單獨決定方向，僅加成/減弱）
-        ml_pred=ml_predictions.get(sym)
-        if ml_pred is not None:
-            agree = (ml_pred>=0.55 and sig["action"]=="buy") or (ml_pred<=0.45 and sig["action"]=="sell")
-            disagree = (ml_pred<=0.40 and sig["action"]=="buy") or (ml_pred>=0.60 and sig["action"]=="sell")
-            if disagree: continue  # ML與技術指標方向衝突，跳過避免假信號
-            if agree: sig["conf"]=min(95,sig["conf"]*1.08)  # ML同意方向，信心加成8%
-        # 進階多因子評分：Market Regime + Multi-Timeframe + VWAP + ORB + Volume Quality 加權算分(0~100)，
-        # VWAP方向衝突在這裡是硬性否決(規格書要求"若方向與VWAP衝突：禁止進場")，不是像calc_signal_py裡只是加減分。
+        if cinfo["limit_down"]>0 and p_now<=cinfo["limit_down"]*1.005: continue  # 接近跌停，做多賣不掉風險高
+        # 還是要算advanced_score：①VWAP硬否決規格明確要求保留 ②regime/orb/volume_quality等輸出
+        # 現在角色變成「餵給LightGBM的特徵」+「事後顯示用的輔助資訊」，不再是獨立的進場門檻
         adv=advanced_score(sym,prices_h,vols_h,dir_)
-        if not adv["vwap_ok"]: continue
-        if adv["grade"]=="none": continue  # 總分沒到80分(C級)門檻，這次不交易
-        # AI預估利潤分數：信心度 x 停利幅度（反映「機率高、且幅度大」的綜合期望值，僅供排序，非保證）
-        est_profit_score = sig["conf"] * cfg["tp"]
-        candidates.append({"sym":sym,"sig":sig,"dir":dir_,"price":p_now,"est_profit_score":est_profit_score,"adv":adv})
+        if not adv["vwap_ok"]: continue  # 規格明確要求保留的VWAP硬否決
+        # LightGBM做多勝率信心度——取代原本的12項指標評分跟進階評分(C級)門檻
+        lgbm_conf=predict_lgbm_confidence(sym,prices_h,vols_h,dir_)
+        if lgbm_conf is None:
+            continue  # 模型還沒訓練/載入失敗：誠實地不交易，不要悄悄退回舊邏輯製造「好像在運作」的假象
+        if lgbm_conf<cfg["min_conf"]: continue  # 沿用既有風險等級門檻(低72%/中68%/高65%)，只是現在門檻比的是模型機率
+        est_profit_score=lgbm_conf*cfg["tp"]
+        candidates.append({"sym":sym,"sig":sig,"dir":dir_,"price":p_now,"est_profit_score":est_profit_score,
+                            "adv":adv,"lgbm_conf":lgbm_conf})
 
-    # 優先依進階多因子總分排序(分數最高=多個維度都確認一致)，同分才看AI預估利潤分數
-    candidates.sort(key=lambda c:(c["adv"]["total"],c["est_profit_score"]),reverse=True)
+    # 依LightGBM信心度排序(信心最高=模型最有把握)，同分才看AI預估利潤分數
+    candidates.sort(key=lambda c:(c["lgbm_conf"],c["est_profit_score"]),reverse=True)
     held_sectors={SECTOR_MAP.get(p["sym"]) for p in auto_state["positions"] if SECTOR_MAP.get(p["sym"])}
     skipped_unaffordable=[]
     opened_this_tick=0
@@ -916,7 +1003,7 @@ def auto_trade_tick():
     for c in candidates:
         if len(auto_state["positions"])>=cfg["max_pos"]: break
         if auto_state["daily_trades"]>=MAX_TRADES_PER_DAY: break  # 風控新增：當日交易次數上限，避免訊號反覆觸發過度交易
-        sym,sig,dir_,p,adv=c["sym"],c["sig"],c["dir"],c["price"],c["adv"]
+        sym,sig,dir_,p,adv,lgbm_conf=c["sym"],c["sig"],c["dir"],c["price"],c["adv"],c["lgbm_conf"]
         # 板塊分散：同板塊已有持倉就跳過這個候選，避免集中壓在同一個產業（如同時押好幾家金融股）
         this_sector=SECTOR_MAP.get(sym)
         if this_sector and this_sector in held_sectors: continue
@@ -924,27 +1011,28 @@ def auto_trade_tick():
         # 1張的曝險動輒幾百萬，遠超過風險設定要動用的資金（例：低風險alloc=5%，100K資金只想動用5,000元，
         # 卻被迫買下252萬元台積電，曝險是帳戶資金的25倍），導致小幅價格波動就被放大成鉅額虧損。
         # 改成：算出來的張數不到1張，就代表這檔股票對目前資金規模太貴，直接跳過、不強迫超額曝險。
-        # 進階評分分級加碼：S/A/B/C分別只用alloc預算的100%/75%/50%/25%，分數越低、信心越不足，部位越小。
-        budget=auto_state["capital"]*(auto_state["cap_pct"]/100)*cfg["alloc"]*adv["size_mult"]
+        # 修正⑩：部位大小依LightGBM信心度分級加碼(S/A/B/C=100%/75%/50%/25%)，取代原本的進階評分分級。
+        budget=auto_state["capital"]*(auto_state["cap_pct"]/100)*cfg["alloc"]*lgbm_size_multiplier(lgbm_conf)
         max_aggregate=auto_state["capital"]*MAX_AGGREGATE_EXPOSURE_PCT/100
         budget=min(budget,max(0,max_aggregate-total_exposure))  # 受總曝險上限約束
         qty=int(budget/(p*1000))
         if qty<1:
             skipped_unaffordable.append((sym,p))
             continue
+        grade=lgbm_grade(lgbm_conf)
         auto_state["positions"].append({
             "sym":sym,"dir":dir_,"qty":qty,"entry":p,
             "sl":round(p*(1-cfg["sl"]/100) if dir_=="L" else p*(1+cfg["sl"]/100),2),
             "tp":round(p*(1+cfg["tp"]/100) if dir_=="L" else p*(1-cfg["tp"]/100),2),
             "open_time":tw_now().strftime("%H:%M:%S"),
             "opened_at":time.time(),  # 數值時間戳，用於計算持倉分鐘數（短炒持倉時間上限判斷）
-            "grade":adv["grade"],"regime":adv["regime"],"entry_reason":build_entry_reason(sig,adv,dir_),
+            "grade":grade,"regime":adv["regime"],"entry_reason":build_entry_reason(lgbm_conf,adv,dir_),
         })
         act=sj.constant.Action.Buy if dir_=="L" else sj.constant.Action.Sell
         _place_real_order(sym,act,qty)
         pool_tag="[股票池]" if (sym not in auto_state["watchlist"]) else ""
-        _log(f"{pool_tag}{'做多▲' if dir_=='L' else '做空▼'} {qty}張@{p:.2f} 信心{sig['conf']:.0f}% "
-             f"評分{adv['total']:.0f}({adv['grade']}級) 市場環境:{adv['regime']}",sym)
+        _log(f"{pool_tag}{'做多▲' if dir_=='L' else '做空▼'} {qty}張@{p:.2f} LightGBM信心{lgbm_conf:.0f}% "
+             f"({grade}級) 市場環境:{adv['regime']}",sym)
         existing.add(sym)
         opened_this_tick+=1
         total_exposure+=p*qty*1000
