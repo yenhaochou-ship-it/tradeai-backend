@@ -484,6 +484,36 @@ def advanced_score(sym:str, prices:List[float], volumes:List[float], dir_:str) -
             "mtf":mtf,"orb_breakout":orb_breakout,"volume_quality":vq,
             "order_flow":of,"fake_breakout_risk":absorb["fake_breakout_risk"]}
 
+def build_entry_reason(sig:Dict, adv:Dict, dir_:str) -> str:
+    """把進場當下實際成立的條件組成一句人看得懂的話，存進trade_history，
+    讓使用者不用回頭翻log或猜，直接在前端看到「為什麼這筆會被買進」。"""
+    parts=[f"技術信心{sig['conf']:.0f}%"]
+    if adv["vwap_ok"]: parts.append("VWAP上方" if dir_=="L" else "VWAP下方")
+    if adv["orb_breakout"]: parts.append("突破開盤區間高點" if dir_=="L" else "跌破開盤區間低點")
+    if adv["regime"] in ("trending_bull","trending_bear"):
+        parts.append(REGIME_LABEL_ZH.get(adv["regime"],adv["regime"]))
+    vq=adv.get("volume_quality",{})
+    if vq.get("score",0)>=70: parts.append(f"量能佳({vq['score']:.0f}分)")
+    of=adv.get("order_flow",{})
+    delta=of.get("delta_recent",0)
+    if (dir_=="L" and delta>0) or (dir_=="S" and delta<0): parts.append("買賣力道方向一致")
+    mtf=adv.get("mtf",{})
+    aligned=mtf.get("aligned_long") if dir_=="L" else mtf.get("aligned_short")
+    if aligned is True: parts.append("多時間框架方向一致")
+    parts.append(f"綜合評分{adv['total']:.0f}分({adv['grade']}級)")
+    return "、".join(parts)
+
+def build_exit_reason(tag:str, cfg:Dict, held_min:float, pp:float) -> str:
+    """出場tag(止盈/停損/持倉超時/反轉)本身已經是分類，這裡補上具體數字，讓使用者看得到「差多少觸發」"""
+    if tag=="止盈": return f"漲幅達{pp:.2f}%，觸及止盈線({cfg['tp']}%)"
+    if tag=="停損": return f"跌幅達{pp:.2f}%，觸及停損線({cfg['sl']}%，含移動停利調整後的價位)"
+    if tag=="持倉超時": return f"已持倉{held_min:.0f}分鐘(上限{cfg['max_hold_min']}分)，漲幅{pp:.2f}%已蓋過成本，獲利了結"
+    if tag=="反轉": return f"持倉{held_min:.0f}分鐘後技術指標轉向，訊號由多翻空提前出場"
+    if tag=="強制平倉": return "13:20當沖規定強制平倉，不留倉過夜"
+    return tag
+
+REGIME_LABEL_ZH={"trending_bull":"多頭趨勢","trending_bear":"空頭趨勢","range":"區間盤整","volatile":"高波動","panic":"恐慌"}
+
 # ══════════════════════════════════════════════════════════════════
 # 全域狀態
 # ══════════════════════════════════════════════════════════════════
@@ -800,6 +830,7 @@ def auto_trade_tick():
                     auto_state["pause_until"]=max(today_close,time.time()+1)
                     _log(f"連虧{auto_state['consec_loss']}次，今日停止交易")
             tag="止盈" if pp>=cfg["tp"] else "停損" if pp<=-cfg["sl"] else "持倉超時" if time_up else "反轉"
+            exit_reason=build_exit_reason(tag,cfg,held_min,pp)
             _log(f"{tag} {pos['dir']} @{p:.2f} 淨損益${net_pnl:.0f}(毛利${gross:.0f}-成本${cost['total_cost']:.0f})",sym)
             auto_state["trade_history"].insert(0,{
                 "sym":sym,"dir":pos["dir"],"qty":pos["qty"],"shares":shares,
@@ -810,6 +841,7 @@ def auto_trade_tick():
                 "open_time":pos.get("open_time",""),"close_time":tw_now().strftime("%H:%M:%S"),
                 "from_pool": sym not in auto_state["watchlist"],
                 "grade":pos.get("grade","-"),"regime":pos.get("regime","-"),
+                "entry_reason":pos.get("entry_reason","-"),"exit_reason":exit_reason,
             })
             auto_state["trade_history"]=auto_state["trade_history"][:50]
             if auto_state.get("paper_mode"): _record_paper_validation()
@@ -906,7 +938,7 @@ def auto_trade_tick():
             "tp":round(p*(1+cfg["tp"]/100) if dir_=="L" else p*(1-cfg["tp"]/100),2),
             "open_time":tw_now().strftime("%H:%M:%S"),
             "opened_at":time.time(),  # 數值時間戳，用於計算持倉分鐘數（短炒持倉時間上限判斷）
-            "grade":adv["grade"],"regime":adv["regime"],
+            "grade":adv["grade"],"regime":adv["regime"],"entry_reason":build_entry_reason(sig,adv,dir_),
         })
         act=sj.constant.Action.Buy if dir_=="L" else sj.constant.Action.Sell
         _place_real_order(sym,act,qty)
@@ -962,6 +994,7 @@ def force_close_all():
                 "open_time":pos.get("open_time",""),"close_time":tw_now().strftime("%H:%M:%S"),
                 "from_pool": sym not in auto_state["watchlist"],
                 "grade":pos.get("grade","-"),"regime":pos.get("regime","-"),
+                "entry_reason":pos.get("entry_reason","-"),"exit_reason":"13:20當沖規定強制平倉，不留倉過夜",
             })
             auto_state["trade_history"]=auto_state["trade_history"][:50]
             if auto_state.get("paper_mode"): _record_paper_validation()
