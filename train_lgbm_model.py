@@ -185,7 +185,7 @@ ML_FEATURE_NAMES=[
     "ma5_ma20_dev_pct","price_vwap_dev_pct",
     "regime_code","mtf_aligned_code",
     "volume_quality_score","bid_ask_imbalance","order_flow_delta_scaled","orb_breakout",
-    "real_ofi_ema","real_big_trade_scaled",
+    "real_ofi_interval","real_big_trade_interval_scaled",
     # 注意：這兩個一樣會是0(中性值)，跟bid_ask_imbalance/order_flow_delta_scaled同樣的限制——
     # 歷史kbars沒有逐筆tick/委託簿資料，沒辦法回溯算出真實OFI/大單流，訓練時這2個特徵也是常數0，
     # 模型一樣學不到怎麼用它們。等之後有辦法收集到歷史tick資料(api.ticks()可查單日逐筆，

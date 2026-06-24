@@ -434,19 +434,24 @@ def detect_absorption(prices: List[float], entries: List[Dict]) -> Dict:
 # 上線後第一件事是看log確認「OFI訂閱成功N/M檔」，並觀察是否持續收到tick/bidask更新。
 # ══════════════════════════════════════════════════════════════════
 class RealTimeOFI:
-    """單一股票的即時大單流計算器。OFI跟大單流分別來自BidAsk跟Tick兩條不同資料流(見上方說明)，
-    所以拆成update_bidask()跟update_tick()兩個方法，不是使用者文件裡假設的單一update函式。"""
+    """單一股票的即時大單流計算器。OFI跟大單流分別來自BidAsk跟Tick兩條不同資料流(見上方說明)。
+    修正：原本用EMA/衰減加總平滑，但這樣「現在讀到的值」混雜了好幾個30秒週期以前的資訊，
+    跟決策引擎每30秒才讀一次的節奏對不齊。改成「累積這個週期內的所有事件，被讀取(flush)時
+    立刻歸零，開始累積下一個週期」——這樣每次決策拿到的就是「乾乾淨淨剛剛這30秒發生的事」，
+    跟bad_time/no_trade_zone這些每30秒重新評估一次的其他風控邏輯節奏一致。"""
     def __init__(self, big_trade_threshold:int=50):
         self.big_trade_threshold=big_trade_threshold  # 台股大單張數門檻，預設單筆超過50張算大單
-        self._prev_bidask=None  # 上一筆BidAsk最佳一檔快照，算OFI delta用
+        self._prev_bidask=None       # 上一筆BidAsk最佳一檔快照，算OFI delta用(不隨週期重置，要連續比較)
+        self.interval_ofi=0.0        # 這個週期內累積的OFI
+        self.interval_big_trade=0.0  # 這個週期內累積的大單流
 
-    def update_bidask(self, bidask) -> float:
-        """bidask是Shioaji的BidAskSTKv1物件，回傳這次更新算出的OFI值(原始值，未平滑)"""
+    def update_bidask(self, bidask):
+        """bidask是Shioaji的BidAskSTKv1物件，把這次更新的OFI累加進這個週期的累積值"""
         cur={"bid_price":float(bidask.bid_price[0]),"bid_volume":int(bidask.bid_volume[0]),
              "ask_price":float(bidask.ask_price[0]),"ask_volume":int(bidask.ask_volume[0])}
         prev=self._prev_bidask
         self._prev_bidask=cur
-        if prev is None: return 0.0
+        if prev is None: return  # 第一筆沒有對照，跳過這次(不影響累積值)
         # OFI核心公式：買一價上漂等於買方掛單整批新增，賣一價下跌等於賣方掛單整批新增，
         # 價格不變則看掛單量的淨變化；買方淨增量-賣方淨增量
         if cur["bid_price"]>prev["bid_price"]: delta_bid=cur["bid_volume"]
@@ -455,47 +460,63 @@ class RealTimeOFI:
         if cur["ask_price"]<prev["ask_price"]: delta_ask=cur["ask_volume"]
         elif cur["ask_price"]==prev["ask_price"]: delta_ask=cur["ask_volume"]-prev["ask_volume"]
         else: delta_ask=0
-        return float(delta_bid-delta_ask)
+        self.interval_ofi+=float(delta_bid-delta_ask)
 
-    def update_tick(self, tick) -> float:
-        """tick是Shioaji的TickSTKv1物件，回傳這筆成交的大單流(沒超過門檻就是0)"""
+    def update_tick(self, tick):
+        """tick是Shioaji的TickSTKv1物件，把這筆成交的大單流(若有)累加進這個週期的累積值。
+        修正(感謝使用者文件提醒)：tick_type==0(無法判定/集合競價)原本被歸進else當成賣出方向算，
+        這是錯的——無法判定不等於賣出，應該完全不計入方向，否則會把中性事件誤判成賣壓。"""
         vol=int(tick.volume)
-        if vol<self.big_trade_threshold: return 0.0
-        return float(vol if int(tick.tick_type)==1 else -vol)
+        if vol<self.big_trade_threshold: return
+        tt=int(tick.tick_type)
+        if tt==1: self.interval_big_trade+=float(vol)        # 外盤(買方主動敲進)
+        elif tt==2: self.interval_big_trade-=float(vol)       # 內盤(賣方主動殺出)
+        # tt==0(無法判定)：不計入，維持原值不變
+
+    def flush(self) -> Tuple[float,float]:
+        """由_update_cache每30秒呼叫一次：取出這個週期累積的(ofi, big_trade)，並立刻歸零開始下一輪。
+        _prev_bidask不歸零，因為那是用來比較「下一筆bidask跟上一筆」的連續狀態，不是週期累積值。"""
+        ofi,big_trade=self.interval_ofi,self.interval_big_trade
+        self.interval_ofi=0.0; self.interval_big_trade=0.0
+        return ofi,big_trade
 
 _ofi_engines: Dict[str,"RealTimeOFI"] = {}
-_ofi_latest: Dict[str,Dict] = {}     # {sym: {"ofi_ema":OFI指數移動平均, "big_trade_sum":近期大單流加總, "updated_at":epoch秒}}
+_ofi_latest: Dict[str,Dict] = {}     # {sym: {"ofi":上一個完整30秒週期的OFI累積值, "big_trade":同期大單流累積值, "updated_at":epoch秒}}
 _ofi_subscribed: set = set()         # 已成功訂閱tick+bidask的股票，避免重複訂閱
-OFI_STALE_SECONDS=120                # 超過這麼久沒收到新tick/bidask，視為資料不新鮮，不採用(可能斷線/該股很冷門)
-_OFI_DEFAULT={"ofi_ema":0.0,"big_trade_sum":0.0,"updated_at":0.0}
 
 def _on_bidask_stk_v1(exchange, bidask):
-    """Shioaji BidAsk callback：訂閱股票的委託簿(五檔)有變動就會被呼叫一次。
-    注意：跑在Shioaji自己的內部執行緒，這裡只做簡單dict寫入，不做重運算/I/O(同_on_tick_stk_v1的說明)。"""
+    """Shioaji BidAsk callback：訂閱股票的委託簿(五檔)有變動就會被呼叫一次，事件驅動、隨時觸發。
+    注意：跑在Shioaji自己的內部執行緒，這裡只做簡單累加，不做重運算/I/O，避免拖慢回調速度。"""
     try:
         sym=bidask.code
         if sym not in _ofi_engines: _ofi_engines[sym]=RealTimeOFI()
-        ofi_value=_ofi_engines[sym].update_bidask(bidask)
-        prev=_ofi_latest.get(sym,_OFI_DEFAULT)
-        new_ofi_ema=prev["ofi_ema"]*0.9+ofi_value*0.1  # 指數移動平均平滑，單筆ofi_value雜訊很大
-        _ofi_latest[sym]={**prev,"ofi_ema":new_ofi_ema,"updated_at":time.time()}
+        _ofi_engines[sym].update_bidask(bidask)
     except Exception as e:
         logger.warning(f"OFI bidask callback處理失敗: {e}")
 
 def _on_tick_stk_v1(exchange, tick):
-    """Shioaji Tick callback：每收到一筆訂閱股票的逐筆成交就會被呼叫一次。
+    """Shioaji Tick callback：每收到一筆訂閱股票的逐筆成交就會被呼叫一次，事件驅動、隨時觸發。
     注意：這個函式跑在Shioaji自己的內部執行緒，不是FastAPI/排程器那條主執行緒——
-    這裡只做簡單的dict寫入(在CPython的GIL保護下，單一assignment是安全的)，
+    這裡只做簡單的累加(在CPython的GIL保護下，單一物件的屬性更新是安全的)，
     不做任何重運算或I/O，避免拖慢回調速度或引入跨執行緒的競爭風險。"""
     try:
         sym=tick.code
         if sym not in _ofi_engines: _ofi_engines[sym]=RealTimeOFI()
-        big_trade_flow=_ofi_engines[sym].update_tick(tick)
-        prev=_ofi_latest.get(sym,_OFI_DEFAULT)
-        new_big_trade_sum=prev["big_trade_sum"]*0.95+big_trade_flow  # 緩慢衰減，近期大單影響較大
-        _ofi_latest[sym]={**prev,"big_trade_sum":new_big_trade_sum,"updated_at":time.time()}
+        _ofi_engines[sym].update_tick(tick)
     except Exception as e:
         logger.warning(f"OFI tick callback處理失敗: {e}")
+
+def _flush_all_ofi():
+    """由_update_cache每30秒呼叫一次（橋接「事件驅動的tick/bidask」跟「定時驅動的決策」兩種節奏）：
+    把每檔已訂閱股票這個週期累積的OFI/大單流取出存進_ofi_latest，並讓引擎歸零開始下一輪累積。
+    對「所有已訂閱」的股票都做，不是只對這次有進入候選名單的股票做——這樣才能保證每檔股票
+    的累積週期都乾淨對齊30秒節奏，不會因為某次被no_trade_zone等規則篩掉就漏了一次flush，
+    導致下次讀到的其實是跨了好幾個30秒週期的累積值。"""
+    for sym in list(_ofi_subscribed):
+        engine=_ofi_engines.get(sym)
+        if engine is None: continue
+        ofi,big_trade=engine.flush()
+        _ofi_latest[sym]={"ofi":ofi,"big_trade":big_trade,"updated_at":time.time()}
 
 def subscribe_ofi_symbols(symbols) -> int:
     """訂閱即時Tick+BidAsk資料流以啟用真實OFI計算(每檔股票需要2個訂閱)。
@@ -529,11 +550,11 @@ def unsubscribe_all_ofi():
     _ofi_subscribed.clear(); _ofi_engines.clear(); _ofi_latest.clear()
 
 def get_real_ofi(sym:str) -> Optional[Dict]:
-    """回傳即時OFI資料，沒有訂閱/還沒收到tick或bidask/資料太舊都回傳None，呼叫端要有none-fallback。"""
-    data=_ofi_latest.get(sym)
-    if not data or not data.get("updated_at"): return None
-    if time.time()-data["updated_at"]>OFI_STALE_SECONDS: return None
-    return data
+    """回傳上一個完整30秒週期的OFI/大單流快照。沒有訂閱這支股票回傳None；
+    已訂閱但這段時間沒有任何tick/bidask事件，會合理地拿到{"ofi":0.0,"big_trade":0.0}
+    (代表這30秒確實沒有方向性流動，0是有意義的真實值，不是「沒資料」，不需要額外的過時判定)。"""
+    if sym not in _ofi_subscribed: return None
+    return _ofi_latest.get(sym,{"ofi":0.0,"big_trade":0.0,"updated_at":time.time()})
 
 def is_no_trade_zone(prices:List[float], volumes:List[float]) -> Tuple[bool,str]:
     """禁止交易區：國定假日(沿用既有行事曆)、連續假日前收盤前時段、月結算日(每月第三個星期三)、
@@ -641,7 +662,7 @@ ML_FEATURE_NAMES=[
     "ma5_ma20_dev_pct","price_vwap_dev_pct",
     "regime_code","mtf_aligned_code",
     "volume_quality_score","bid_ask_imbalance","order_flow_delta_scaled","orb_breakout",
-    "real_ofi_ema","real_big_trade_scaled",  # 模組一：真實逐筆tick訂閱算出的OFI/大單流，沒有即時資料時給0(中性)
+    "real_ofi_interval","real_big_trade_interval_scaled",  # 模組一：上一個30秒週期累積的真實OFI/大單流，沒訂閱時給0(中性)
 ]
 _REGIME_CODE={"trending_bull":2,"trending_bear":-2,"range":0,"volatile":1,"panic":-3,"unknown":0}
 
@@ -674,8 +695,8 @@ def extract_ml_features(sym:str, prices:List[float], volumes:List[float], dir_:s
         _REGIME_CODE.get(regime["regime"],0), mtf_code,
         vq.get("score",50), vq.get("bid_ask_imbalance",0),
         of.get("delta_recent",0)/1000.0, orb_hit,
-        real_ofi["ofi_ema"] if real_ofi else 0.0,
-        (real_ofi["big_trade_sum"]/1000.0) if real_ofi else 0.0,
+        real_ofi["ofi"] if real_ofi else 0.0,
+        (real_ofi["big_trade"]/1000.0) if real_ofi else 0.0,
     ]
 
 _lgbm_model={"booster":None,"loaded":False,"path":None,"error":None}
@@ -964,6 +985,9 @@ def _update_cache():
             price_cache[sym].append({"price":snap["price"],"volume":interval_vol,"t":time.time(),
                                       "buy_vol":snap["buy_vol"],"sell_vol":snap["sell_vol"],"tick_type":snap["tick_type"]})
             price_cache[sym]=price_cache[sym][-MAX_BARS:]
+    # 模組一橋接：把這30秒內(事件驅動)累積的OFI/大單流取出存進_ofi_latest並歸零，
+    # 跟上面的價格輪詢共用同一個30秒心跳，確保每檔股票的累積週期跟決策節奏對齊
+    _flush_all_ofi()
 
 def _reset_daily():
     today=tw_now().strftime("%Y-%m-%d")
