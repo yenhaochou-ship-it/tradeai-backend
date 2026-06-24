@@ -415,6 +415,126 @@ def detect_absorption(prices: List[float], entries: List[Dict]) -> Dict:
     return {"fake_breakout_risk":making_new_high and of["delta_recent"]<=0,
             "delta_recent":of["delta_recent"],"note":of["note"]}
 
+# ══════════════════════════════════════════════════════════════════
+# 模組一：即時大單流 OFI 引擎（真逐筆tick/bidask訂閱，取代上面approx_order_flow的輪詢近似版）
+#
+# 重要更正：一開始我以為Tick資料本身就有bid_price/ask_price可以用，省掉另外訂閱BidAsk——
+# 這是錯的。我去查證Shioaji官方文件完整欄位列表後發現，TickSTKv1根本沒有bid_price/ask_price
+# 這些欄位(它只有volume/tick_type/bid_side_total_vol這類彙總資訊)，bid_price/bid_volume/
+# ask_price/ask_volume只存在於另一條獨立的BidAskSTKv1資料流。所以這裡需要分開訂閱+處理：
+#   - Tick資料流(TickSTKv1)：volume(這筆成交量) + tick_type(1=外盤買進 2=內盤賣出) → 算大單流
+#   - BidAsk資料流(BidAskSTKv1)：bid_price/bid_volume/ask_price/ask_volume(五檔，這裡只用最佳一檔)
+#     → 算OFI(委託簿不平衡)
+# 使用者參考文件裡的tick格式(bid_p1/bid_v1/is_market_buy合併在一個tick裡)是範例性質的假格式，
+# 不是Shioaji真正的資料結構，已經改成上面查證過的真實雙資料流設計。
+#
+# ⚠️ 跟之前所有Phase1/2引擎一樣的免責聲明：這段程式碼沒有真實永豐連線測試過，
+# 欄位名稱/訂閱語法都查證自官方文件並對照過真實範例輸出，但實際訂閱/callback行為
+# （會不會準時收到、46檔×2條資料流=92個訂閱會不會卡額度、斷線重連)沒有人驗證過。
+# 上線後第一件事是看log確認「OFI訂閱成功N/M檔」，並觀察是否持續收到tick/bidask更新。
+# ══════════════════════════════════════════════════════════════════
+class RealTimeOFI:
+    """單一股票的即時大單流計算器。OFI跟大單流分別來自BidAsk跟Tick兩條不同資料流(見上方說明)，
+    所以拆成update_bidask()跟update_tick()兩個方法，不是使用者文件裡假設的單一update函式。"""
+    def __init__(self, big_trade_threshold:int=50):
+        self.big_trade_threshold=big_trade_threshold  # 台股大單張數門檻，預設單筆超過50張算大單
+        self._prev_bidask=None  # 上一筆BidAsk最佳一檔快照，算OFI delta用
+
+    def update_bidask(self, bidask) -> float:
+        """bidask是Shioaji的BidAskSTKv1物件，回傳這次更新算出的OFI值(原始值，未平滑)"""
+        cur={"bid_price":float(bidask.bid_price[0]),"bid_volume":int(bidask.bid_volume[0]),
+             "ask_price":float(bidask.ask_price[0]),"ask_volume":int(bidask.ask_volume[0])}
+        prev=self._prev_bidask
+        self._prev_bidask=cur
+        if prev is None: return 0.0
+        # OFI核心公式：買一價上漂等於買方掛單整批新增，賣一價下跌等於賣方掛單整批新增，
+        # 價格不變則看掛單量的淨變化；買方淨增量-賣方淨增量
+        if cur["bid_price"]>prev["bid_price"]: delta_bid=cur["bid_volume"]
+        elif cur["bid_price"]==prev["bid_price"]: delta_bid=cur["bid_volume"]-prev["bid_volume"]
+        else: delta_bid=0
+        if cur["ask_price"]<prev["ask_price"]: delta_ask=cur["ask_volume"]
+        elif cur["ask_price"]==prev["ask_price"]: delta_ask=cur["ask_volume"]-prev["ask_volume"]
+        else: delta_ask=0
+        return float(delta_bid-delta_ask)
+
+    def update_tick(self, tick) -> float:
+        """tick是Shioaji的TickSTKv1物件，回傳這筆成交的大單流(沒超過門檻就是0)"""
+        vol=int(tick.volume)
+        if vol<self.big_trade_threshold: return 0.0
+        return float(vol if int(tick.tick_type)==1 else -vol)
+
+_ofi_engines: Dict[str,"RealTimeOFI"] = {}
+_ofi_latest: Dict[str,Dict] = {}     # {sym: {"ofi_ema":OFI指數移動平均, "big_trade_sum":近期大單流加總, "updated_at":epoch秒}}
+_ofi_subscribed: set = set()         # 已成功訂閱tick+bidask的股票，避免重複訂閱
+OFI_STALE_SECONDS=120                # 超過這麼久沒收到新tick/bidask，視為資料不新鮮，不採用(可能斷線/該股很冷門)
+_OFI_DEFAULT={"ofi_ema":0.0,"big_trade_sum":0.0,"updated_at":0.0}
+
+def _on_bidask_stk_v1(exchange, bidask):
+    """Shioaji BidAsk callback：訂閱股票的委託簿(五檔)有變動就會被呼叫一次。
+    注意：跑在Shioaji自己的內部執行緒，這裡只做簡單dict寫入，不做重運算/I/O(同_on_tick_stk_v1的說明)。"""
+    try:
+        sym=bidask.code
+        if sym not in _ofi_engines: _ofi_engines[sym]=RealTimeOFI()
+        ofi_value=_ofi_engines[sym].update_bidask(bidask)
+        prev=_ofi_latest.get(sym,_OFI_DEFAULT)
+        new_ofi_ema=prev["ofi_ema"]*0.9+ofi_value*0.1  # 指數移動平均平滑，單筆ofi_value雜訊很大
+        _ofi_latest[sym]={**prev,"ofi_ema":new_ofi_ema,"updated_at":time.time()}
+    except Exception as e:
+        logger.warning(f"OFI bidask callback處理失敗: {e}")
+
+def _on_tick_stk_v1(exchange, tick):
+    """Shioaji Tick callback：每收到一筆訂閱股票的逐筆成交就會被呼叫一次。
+    注意：這個函式跑在Shioaji自己的內部執行緒，不是FastAPI/排程器那條主執行緒——
+    這裡只做簡單的dict寫入(在CPython的GIL保護下，單一assignment是安全的)，
+    不做任何重運算或I/O，避免拖慢回調速度或引入跨執行緒的競爭風險。"""
+    try:
+        sym=tick.code
+        if sym not in _ofi_engines: _ofi_engines[sym]=RealTimeOFI()
+        big_trade_flow=_ofi_engines[sym].update_tick(tick)
+        prev=_ofi_latest.get(sym,_OFI_DEFAULT)
+        new_big_trade_sum=prev["big_trade_sum"]*0.95+big_trade_flow  # 緩慢衰減，近期大單影響較大
+        _ofi_latest[sym]={**prev,"big_trade_sum":new_big_trade_sum,"updated_at":time.time()}
+    except Exception as e:
+        logger.warning(f"OFI tick callback處理失敗: {e}")
+
+def subscribe_ofi_symbols(symbols) -> int:
+    """訂閱即時Tick+BidAsk資料流以啟用真實OFI計算(每檔股票需要2個訂閱)。
+    逐檔try/except，一檔失敗不影響其他檔，回傳成功訂閱數量——
+    如果這個數字遠小於預期，代表可能撞到訂閱數上限(46檔*2=92個訂閱不算少)，要去看log warning。"""
+    if not sinopac_api: return 0
+    ok_count=0
+    for sym in symbols:
+        if sym in _ofi_subscribed: continue
+        try:
+            contract=sinopac_api.Contracts.Stocks.get(sym)
+            if not contract: continue
+            sinopac_api.quote.subscribe(contract,quote_type=sj.constant.QuoteType.Tick,version=sj.constant.QuoteVersion.v1)
+            sinopac_api.quote.subscribe(contract,quote_type=sj.constant.QuoteType.BidAsk,version=sj.constant.QuoteVersion.v1)
+            _ofi_subscribed.add(sym)
+            ok_count+=1
+        except Exception as e:
+            logger.warning(f"OFI訂閱{sym}失敗(可能撞到訂閱數上限): {e}")
+    return ok_count
+
+def unsubscribe_all_ofi():
+    if not sinopac_api: return
+    for sym in list(_ofi_subscribed):
+        try:
+            contract=sinopac_api.Contracts.Stocks.get(sym)
+            if contract:
+                sinopac_api.quote.unsubscribe(contract,quote_type=sj.constant.QuoteType.Tick,version=sj.constant.QuoteVersion.v1)
+                sinopac_api.quote.unsubscribe(contract,quote_type=sj.constant.QuoteType.BidAsk,version=sj.constant.QuoteVersion.v1)
+        except Exception as e:
+            logger.warning(f"OFI取消訂閱{sym}失敗: {e}")
+    _ofi_subscribed.clear(); _ofi_engines.clear(); _ofi_latest.clear()
+
+def get_real_ofi(sym:str) -> Optional[Dict]:
+    """回傳即時OFI資料，沒有訂閱/還沒收到tick或bidask/資料太舊都回傳None，呼叫端要有none-fallback。"""
+    data=_ofi_latest.get(sym)
+    if not data or not data.get("updated_at"): return None
+    if time.time()-data["updated_at"]>OFI_STALE_SECONDS: return None
+    return data
+
 def is_no_trade_zone(prices:List[float], volumes:List[float]) -> Tuple[bool,str]:
     """禁止交易區：國定假日(沿用既有行事曆)、連續假日前收盤前時段、月結算日(每月第三個星期三)、
     成交量過低、波動度過低(代用指標，沒有逐筆資料算不出真正ATR)。
@@ -521,6 +641,7 @@ ML_FEATURE_NAMES=[
     "ma5_ma20_dev_pct","price_vwap_dev_pct",
     "regime_code","mtf_aligned_code",
     "volume_quality_score","bid_ask_imbalance","order_flow_delta_scaled","orb_breakout",
+    "real_ofi_ema","real_big_trade_scaled",  # 模組一：真實逐筆tick訂閱算出的OFI/大單流，沒有即時資料時給0(中性)
 ]
 _REGIME_CODE={"trending_bull":2,"trending_bear":-2,"range":0,"volatile":1,"panic":-3,"unknown":0}
 
@@ -536,6 +657,7 @@ def extract_ml_features(sym:str, prices:List[float], volumes:List[float], dir_:s
     vq=volume_quality_score(volumes,entries)
     of=approx_order_flow(entries)
     orb=orb_range(entries,tw_now().strftime("%Y-%m-%d"))
+    real_ofi=get_real_ofi(sym)  # 模組一：真實tick訂閱資料，沒有(還沒訂閱/還沒收到tick/太舊)就是None
 
     ma20=sig.get("ma20") or 1
     vwap=sig.get("vwap") or 1
@@ -552,6 +674,8 @@ def extract_ml_features(sym:str, prices:List[float], volumes:List[float], dir_:s
         _REGIME_CODE.get(regime["regime"],0), mtf_code,
         vq.get("score",50), vq.get("bid_ask_imbalance",0),
         of.get("delta_recent",0)/1000.0, orb_hit,
+        real_ofi["ofi_ema"] if real_ofi else 0.0,
+        (real_ofi["big_trade_sum"]/1000.0) if real_ofi else 0.0,
     ]
 
 _lgbm_model={"booster":None,"loaded":False,"path":None,"error":None}
@@ -595,16 +719,26 @@ def predict_lgbm_confidence(sym:str, prices:List[float], volumes:List[float], di
         return None
 
 def lgbm_grade(conf:float) -> str:
-    """沿用原本S/A/B/C分級的精神(信心越高部位越大)，改成依LightGBM信心度分級。
-    90/83/77這幾個門檻是合理起點，沒有校準過，建議拿真實預測結果回頭驗證調整。"""
+    """純粹顯示用的等級標籤(沿用S/A/B/C視覺風格)，不再決定部位大小——
+    部位大小現在由下面的連續線性公式決定，這裡只是給前端一個好懂的徽章。"""
     if conf>=90: return "S"
     if conf>=83: return "A"
     if conf>=77: return "B"
     return "C"
 
-def lgbm_size_multiplier(conf:float) -> float:
-    g=lgbm_grade(conf)
-    return {"S":1.0,"A":0.75,"B":0.5,"C":0.25}[g]
+def calculate_dynamic_position_ratio(win_prob_pct:float, min_conf_pct:float, max_alloc_pct:float) -> float:
+    """LightGBM機率動態部位縮放——連續線性比例，取代原本S/A/B/C離散分級跳階。
+    勝率剛好等於門檻時給最大曝險額度的30%當基本底倉，勝率趨近100%時線性放大到最大曝險上限，
+    公式：(勝率-門檻)/(100-門檻)，限制在0~1之間，再用 0.3+0.7*scaling_factor 算出實際比例。
+
+    注意：max_alloc_pct沿用你既有RISK_CFG的alloc(低5%/中10%/高20%)，不是規格書建議的30%/20%/10%——
+    那組數字跟現有的「總曝險30%上限」疊在一起，會讓低風險單筆信心夠高時就用滿30%總曝險額度，
+    等於低風險變成最集中而不是最分散，跟風險等級的一般直覺相反。如果你還是想要規格書那組數字，
+    跟我說一聲，我可以照那組數字改，這裡先用跟現有風控設計一致的數字。"""
+    if win_prob_pct < min_conf_pct: return 0.0
+    scaling_factor = (win_prob_pct - min_conf_pct) / (100.0 - min_conf_pct)
+    scaling_factor = max(0.0, min(1.0, scaling_factor))
+    return max_alloc_pct/100 * (0.3 + 0.7*scaling_factor)
 
 # ══════════════════════════════════════════════════════════════════
 # 全域狀態
@@ -1012,7 +1146,9 @@ def auto_trade_tick():
         # 卻被迫買下252萬元台積電，曝險是帳戶資金的25倍），導致小幅價格波動就被放大成鉅額虧損。
         # 改成：算出來的張數不到1張，就代表這檔股票對目前資金規模太貴，直接跳過、不強迫超額曝險。
         # 修正⑩：部位大小依LightGBM信心度分級加碼(S/A/B/C=100%/75%/50%/25%)，取代原本的進階評分分級。
-        budget=auto_state["capital"]*(auto_state["cap_pct"]/100)*cfg["alloc"]*lgbm_size_multiplier(lgbm_conf)
+        # 模組二：LightGBM機率動態部位縮放（連續線性比例），取代原本的離散分級加碼
+        alloc_ratio=calculate_dynamic_position_ratio(lgbm_conf,cfg["min_conf"],cfg["alloc"]*100)
+        budget=auto_state["capital"]*(auto_state["cap_pct"]/100)*alloc_ratio
         max_aggregate=auto_state["capital"]*MAX_AGGREGATE_EXPOSURE_PCT/100
         budget=min(budget,max(0,max_aggregate-total_exposure))  # 受總曝險上限約束
         qty=int(budget/(p*1000))
@@ -1287,6 +1423,17 @@ async def connect(req:ConnectRequest, background_tasks:BackgroundTasks):
             _log(f"資金已同步：可用NT${cap_info['available_after_settlement']:.0f}（扣除待交割款）")
         _log(f"永豐帳戶連接成功 CA={'✓' if ca_ok else '✗'}")
         background_tasks.add_task(scan_top_stocks)  # 連線成功後立即在背景開始掃描，不用等5分鐘排程
+        # 模組一：註冊tick+bidask callback並訂閱即時OFI資料流(watchlist+股票池)，背景執行避免拖慢連線回應
+        try:
+            api.quote.set_on_tick_stk_v1_callback(_on_tick_stk_v1)
+            api.quote.set_on_bidask_stk_v1_callback(_on_bidask_stk_v1)
+        except Exception as e:
+            logger.warning(f"OFI callback註冊失敗，真實OFI將停用(extract_ml_features會用0中性值): {e}")
+        ofi_symbols=list(set(auto_state["watchlist"]) | set(SCAN_UNIVERSE))
+        def _do_ofi_subscribe():
+            n_ok=subscribe_ofi_symbols(ofi_symbols)
+            _log(f"OFI即時訂閱完成：{n_ok}/{len(ofi_symbols)}檔成功"+("" if n_ok==len(ofi_symbols) else "（有股票訂閱失敗，那些股票的order_flow特徵會用0中性值代替，看log warning找原因）"))
+        background_tasks.add_task(_do_ofi_subscribe)
         return {"success":True,"stock_account":str(stock_account) if stock_account else None,
                 "future_account":str(future_account) if future_account else None,
                 "total_accounts":len(accounts),"ca_activated":ca_ok}
@@ -1299,6 +1446,7 @@ async def disconnect():
     global sinopac_api,stock_account,future_account
     auto_state["enabled"]=False
     try:
+        unsubscribe_all_ofi()  # 模組一：登出前先取消tick訂閱、清空OFI狀態，避免殘留訂閱占用額度
         if sinopac_api: sinopac_api.logout()
         sinopac_api=stock_account=future_account=None
         return {"success":True}
@@ -1371,6 +1519,9 @@ async def get_paper_validation():
 async def update_watchlist(watchlist:List[str]):
     auto_state["watchlist"]=watchlist
     _persist_auto_state()
+    if sinopac_api:  # 模組一：自選股新增的股票也要補訂閱OFI，不然extract_ml_features對它們永遠拿不到即時OFI
+        n_ok=subscribe_ofi_symbols(watchlist)
+        if n_ok>0: _log(f"自選股更新，補訂閱OFI {n_ok}檔")
     return {"success":True,"watchlist":watchlist}
 
 # ── ML 模型預測同步（前端訓練完成後呼叫，讓後端下單邏輯參考ML判斷）──────
