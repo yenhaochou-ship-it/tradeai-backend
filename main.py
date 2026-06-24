@@ -805,20 +805,43 @@ PAPER_VALIDATION_MIN_DAYS=5
 MAX_TRADES_PER_DAY=3        # 規格書新增風控：當日最多交易3次，避免訊號反覆觸發造成過度交易、手續費侵蝕獲利
 CONSEC_LOSS_STOP=2          # 規格書收緊：原本連虧3次冷靜15分鐘，改成連虧2次直接停止當日交易(更保守)
 
-def _record_paper_validation():
-    """每筆模擬交易平倉後呼叫：累積驗證進度，trade_count/trading_days不會被_reset_daily清空"""
-    pv=auto_state.setdefault("paper_validation",{"trade_count":0,"trading_days":[]})
+def _record_paper_validation(pnl:float=0.0, pct:float=0.0):
+    """每筆模擬交易平倉後呼叫：累積驗證進度，trade_count/trading_days/累積損益都不會被_reset_daily清空。
+    修正：原本只記trade_count/trading_days，沒記損益細節——但trade_history每天會被_reset_daily清空，
+    等20筆+5天驗證期跑完時，根本沒有資料可以回頭算「這段期間整體的Profit Factor/勝率」，
+    只能看到「今天」的數字。改成額外累積總贏/總輸金額跟勝負次數，才能算出真正跨天的驗證報告。"""
+    pv=auto_state.setdefault("paper_validation",{"trade_count":0,"trading_days":[],
+                              "total_win_pnl":0.0,"total_loss_pnl":0.0,"wins":0,"losses":0,
+                              "win_pct_sum":0.0,"loss_pct_sum":0.0})
     pv["trade_count"]=pv.get("trade_count",0)+1
     today_str=tw_now().strftime("%Y-%m-%d")
     if today_str not in pv.get("trading_days",[]):
         pv.setdefault("trading_days",[]).append(today_str)
+    if pnl>0:
+        pv["wins"]=pv.get("wins",0)+1
+        pv["total_win_pnl"]=pv.get("total_win_pnl",0.0)+pnl
+        pv["win_pct_sum"]=pv.get("win_pct_sum",0.0)+pct
+    elif pnl<0:
+        pv["losses"]=pv.get("losses",0)+1
+        pv["total_loss_pnl"]=pv.get("total_loss_pnl",0.0)+pnl  # 存負數，方便後面算profit factor時取絕對值
+        pv["loss_pct_sum"]=pv.get("loss_pct_sum",0.0)+pct
 
 def _paper_validation_progress() -> dict:
     pv=auto_state.get("paper_validation",{"trade_count":0,"trading_days":[]})
     trades=pv.get("trade_count",0); days=len(pv.get("trading_days",[]))
     ok = trades>=PAPER_VALIDATION_MIN_TRADES and days>=PAPER_VALIDATION_MIN_DAYS
+    wins=pv.get("wins",0); losses=pv.get("losses",0)
+    total_win=pv.get("total_win_pnl",0.0); total_loss=pv.get("total_loss_pnl",0.0)
+    # Profit Factor：總贏的錢/總輸的錢(取絕對值)，業界常用門檻是>1.5才算「具備實盤印鈔能力」
+    profit_factor=round(total_win/abs(total_loss),2) if total_loss!=0 else (float("inf") if total_win>0 else 0.0)
+    win_rate=round(wins/(wins+losses)*100,1) if (wins+losses)>0 else 0.0
+    avg_win_pct=round(pv.get("win_pct_sum",0.0)/wins,2) if wins>0 else 0.0
+    avg_loss_pct=round(pv.get("loss_pct_sum",0.0)/losses,2) if losses>0 else 0.0
     return {"trades":trades,"days":days,"min_trades":PAPER_VALIDATION_MIN_TRADES,
-            "min_days":PAPER_VALIDATION_MIN_DAYS,"ready_for_real":ok}
+            "min_days":PAPER_VALIDATION_MIN_DAYS,"ready_for_real":ok,
+            "win_rate":win_rate,"profit_factor":profit_factor,
+            "avg_win_pct":avg_win_pct,"avg_loss_pct":avg_loss_pct,
+            "total_pnl":round(total_win+total_loss,0)}
 
 price_cache: Dict[str,List[Dict]] = {}
 _last_cum_volume: Dict[str,int] = {}  # 修正：追蹤每檔股票上次輪詢時的累計成交量，用來換算成「這次輪詢期間」的增量
@@ -1097,7 +1120,7 @@ def auto_trade_tick():
                 "entry_reason":pos.get("entry_reason","-"),"exit_reason":exit_reason,
             })
             auto_state["trade_history"]=auto_state["trade_history"][:50]
-            if auto_state.get("paper_mode"): _record_paper_validation()
+            if auto_state.get("paper_mode"): _record_paper_validation(net_pnl,pp)
             # 漲跌停鎖死風險提示（不對稱）：做空遇漲停鎖死是真正危險（違約交割+借券費），
             # 做多遇跌停沖不掉則只是變成一般T+2持股，風險輕微，用不同等級的提示
             cinfo=get_contract_info(sym)
@@ -1248,7 +1271,7 @@ def force_close_all():
                 "entry_reason":pos.get("entry_reason","-"),"exit_reason":"13:20當沖規定強制平倉，不留倉過夜",
             })
             auto_state["trade_history"]=auto_state["trade_history"][:50]
-            if auto_state.get("paper_mode"): _record_paper_validation()
+            if auto_state.get("paper_mode"): _record_paper_validation(net_pnl,pp_fc)
         except Exception as e:
             logger.warning(f"強制平倉{sym}損益計算失敗（委託仍會送出）: {e}")
         act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
@@ -1259,7 +1282,16 @@ def force_close_all():
 def post_market_summary():
     d=auto_state["daily_trades"] or 1
     wr=auto_state["daily_win"]/d*100
-    _log(f"盤後總結 | P&L:${auto_state['daily_pnl']:.0f} | 勝率:{wr:.0f}%({auto_state['daily_win']}/{auto_state['daily_trades']})")
+    today_trades=auto_state.get("trade_history",[])
+    wins=[t for t in today_trades if t.get("pnl",0)>0]
+    losses=[t for t in today_trades if t.get("pnl",0)<0]
+    total_win=sum(t["pnl"] for t in wins); total_loss=sum(t["pnl"] for t in losses)
+    pf=round(total_win/abs(total_loss),2) if total_loss!=0 else (float("inf") if total_win>0 else 0.0)
+    avg_win=round(sum(t["pct"] for t in wins)/len(wins),2) if wins else 0.0
+    avg_loss=round(sum(t["pct"] for t in losses)/len(losses),2) if losses else 0.0
+    pf_str="∞" if pf==float("inf") else f"{pf:.2f}"
+    _log(f"盤後總結 | P&L:${auto_state['daily_pnl']:.0f} | 勝率:{wr:.0f}%({auto_state['daily_win']}/{auto_state['daily_trades']}) "
+         f"| 獲利因子:{pf_str}(>1.5算及格) | 平均贏{avg_win:+.2f}% 平均輸{avg_loss:+.2f}%")
 
 def ml_training_window():
     _log("21:00 ML訓練時段開始（前端訓練請在學習分頁執行）")
