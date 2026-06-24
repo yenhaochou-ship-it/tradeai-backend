@@ -1043,12 +1043,15 @@ def auto_trade_tick():
         min_move=min_profitable_move_pct()
         time_up=held_min>=cfg.get("max_hold_min",40) and pp>=min_move
         # 移動停利：獲利超過1.5%後啟動，停損價跟隨移動鎖定部分獲利（新倉只會是多單，但保留方向判斷以正確處理限制前就存在的舊空單）
+        # 修正：原本回檔寬度1.2%，跟1.5%啟動門檻太接近，剛啟動時的安全margin只有0.3%，
+        # 連來回成本(~0.32%)都蓋不過——峰值漲幅落在1.5%~1.6%之間反轉的單子，扣成本後幾乎是平的或微虧，
+        # 移動停利等於沒有真正鎖到任何淨利。收緊到0.5%，啟動瞬間就有約0.67%的淨利margin，不再卡在成本線上。
         if pp>=1.5:
             if pos["dir"]=="L":
-                trail_sl=round(p*0.988,2)  # 距目前價1.2%
+                trail_sl=round(p*0.995,2)  # 距目前價0.5%
                 if trail_sl>pos["sl"]: pos["sl"]=trail_sl
             else:
-                trail_sl=round(p*1.012,2)
+                trail_sl=round(p*1.005,2)
                 if trail_sl<pos["sl"]: pos["sl"]=trail_sl
         close=(p<=pos["sl"] if pos["dir"]=="L" else p>=pos["sl"]) or pp>=cfg["tp"] or time_up
         # 修正③：剛進場的訊號雜訊較大（每30秒就重算一次），給它一段穩定期再讓「反轉」訊號出場生效，
