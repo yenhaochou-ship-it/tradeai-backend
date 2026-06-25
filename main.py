@@ -2,12 +2,12 @@
 TradeAI Pro 後端 v2.0 — 24小時自動交易機器人
 台股時段：09:30-13:00主動交易 | 08:00盤前準備 | 13:00停開新倉 | 13:20強制平倉 | 14:30盤後總結
 """
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Tuple
 import shioaji as sj
-import os, logging, base64, tempfile, time, sqlite3, json
+import os, logging, base64, tempfile, time, sqlite3, json, csv, io
 from datetime import datetime, timedelta
 import pytz
 import requests
@@ -725,19 +725,21 @@ def _load_lgbm_model():
         logger.warning(f"⚠️ LightGBM{_lgbm_model['error']}")
     return _lgbm_model["booster"]
 
-def predict_lgbm_confidence(sym:str, prices:List[float], volumes:List[float], dir_:str="L") -> Optional[float]:
-    """回傳LightGBM模型預測的「做多勝率信心度」(0~100)。模型不存在/特徵不足/預測失敗都回傳None，
-    呼叫端看到None就該跳過該候選——不會也不該悄悄退回舊的規則式評分，那樣等於沒有真的換掉。"""
+def predict_lgbm_confidence(sym:str, prices:List[float], volumes:List[float], dir_:str="L") -> Tuple[Optional[float],Optional[List[float]]]:
+    """回傳(LightGBM預測的「做多勝率信心度」(0~100), 餵進模型的特徵向量)。模型不存在/特徵不足/預測失敗
+    都回傳(None,None)，呼叫端看到None就該跳過該候選——不會也不該悄悄退回舊的規則式評分，那樣等於沒有真的換掉。
+    修正：原本只回傳信心度，特徵向量算完就丟，事後沒有任何資料可以回頭做SHAP特徵歸因分析——
+    5天驗證期跑完想分析「到底哪個特徵真的有用、哪個是雜訊」時，會發現根本沒有歷史特徵資料可以分析。"""
     booster=_load_lgbm_model()
-    if booster is None: return None
+    if booster is None: return None,None
     feats=extract_ml_features(sym,prices,volumes,dir_)
-    if feats is None: return None
+    if feats is None: return None,None
     try:
         prob=booster.predict([feats])[0]
-        return float(max(0.0,min(100.0,prob*100)))
+        return float(max(0.0,min(100.0,prob*100))),feats
     except Exception as e:
         logger.warning(f"LightGBM預測失敗 {sym}: {e}")
-        return None
+        return None,None
 
 def lgbm_grade(conf:float) -> str:
     """純粹顯示用的等級標籤(沿用S/A/B/C視覺風格)，不再決定部位大小——
@@ -826,7 +828,19 @@ def _record_paper_validation(pnl:float=0.0, pct:float=0.0):
         pv["total_loss_pnl"]=pv.get("total_loss_pnl",0.0)+pnl  # 存負數，方便後面算profit factor時取絕對值
         pv["loss_pct_sum"]=pv.get("loss_pct_sum",0.0)+pct
 
-def _paper_validation_progress() -> dict:
+def _record_feature_log(sym:str, pos:Dict, pnl:float, pct:float, tag:str):
+    """每筆交易平倉時記錄當時餵給LightGBM的完整特徵向量+結果，跨天累積不會被_reset_daily清空。
+    這是5天驗證期跑完後做SHAP特徵歸因分析(到底哪個特徵真的有用、哪個是雜訊)的原始資料——
+    沒有這個log，模型預測完特徵向量就丟了，事後完全沒有資料可以回頭分析，分析計畫根本做不了。
+    上限500筆，20筆驗證門檻的數十倍，不會無限長大，又遠超過5天能累積的真實交易量。"""
+    log=auto_state.setdefault("feature_log",[])
+    entry={"ts":tw_now().strftime("%Y-%m-%d %H:%M:%S"),"sym":sym,"pnl":round(pnl,0),"pct":round(pct,2),
+           "tag":tag,"lgbm_conf":pos.get("lgbm_conf"),"win":1 if pnl>0 else 0}
+    entry.update(pos.get("features",{}))
+    log.append(entry)
+    auto_state["feature_log"]=log[-500:]
+
+
     pv=auto_state.get("paper_validation",{"trade_count":0,"trading_days":[]})
     trades=pv.get("trade_count",0); days=len(pv.get("trading_days",[]))
     ok = trades>=PAPER_VALIDATION_MIN_TRADES and days>=PAPER_VALIDATION_MIN_DAYS
@@ -1149,7 +1163,9 @@ def auto_trade_tick():
                 "entry_reason":pos.get("entry_reason","-"),"exit_reason":exit_reason,
             })
             auto_state["trade_history"]=auto_state["trade_history"][:50]
-            if auto_state.get("paper_mode"): _record_paper_validation(net_pnl,pp)
+            if auto_state.get("paper_mode"):
+                _record_paper_validation(net_pnl,pp)
+                _record_feature_log(sym,pos,net_pnl,pp,tag)
             # 漲跌停鎖死風險提示（不對稱）：做空遇漲停鎖死是真正危險（違約交割+借券費），
             # 做多遇跌停沖不掉則只是變成一般T+2持股，風險輕微，用不同等級的提示
             cinfo=get_contract_info(sym)
@@ -1196,13 +1212,13 @@ def auto_trade_tick():
         adv=advanced_score(sym,prices_h,vols_h,dir_)
         if not adv["vwap_ok"]: continue  # 規格明確要求保留的VWAP硬否決
         # LightGBM做多勝率信心度——取代原本的12項指標評分跟進階評分(C級)門檻
-        lgbm_conf=predict_lgbm_confidence(sym,prices_h,vols_h,dir_)
+        lgbm_conf,lgbm_feats=predict_lgbm_confidence(sym,prices_h,vols_h,dir_)
         if lgbm_conf is None:
             continue  # 模型還沒訓練/載入失敗：誠實地不交易，不要悄悄退回舊邏輯製造「好像在運作」的假象
         if lgbm_conf<cfg["min_conf"]: continue  # 沿用既有風險等級門檻(低72%/中68%/高65%)，只是現在門檻比的是模型機率
         est_profit_score=lgbm_conf*cfg["tp"]
         candidates.append({"sym":sym,"sig":sig,"dir":dir_,"price":p_now,"est_profit_score":est_profit_score,
-                            "adv":adv,"lgbm_conf":lgbm_conf})
+                            "adv":adv,"lgbm_conf":lgbm_conf,"lgbm_feats":lgbm_feats})
 
     # 依LightGBM信心度排序(信心最高=模型最有把握)，同分才看AI預估利潤分數
     candidates.sort(key=lambda c:(c["lgbm_conf"],c["est_profit_score"]),reverse=True)
@@ -1221,7 +1237,7 @@ def auto_trade_tick():
         if len(auto_state["positions"])>=cfg["max_pos"]: break
         if auto_state["daily_trades"]>=MAX_TRADES_PER_DAY: break  # 風控新增：當日交易次數上限，避免訊號反覆觸發過度交易
         if opened_this_tick>=MAX_NEW_ENTRIES_PER_TICK: break
-        sym,sig,dir_,p,adv,lgbm_conf=c["sym"],c["sig"],c["dir"],c["price"],c["adv"],c["lgbm_conf"]
+        sym,sig,dir_,p,adv,lgbm_conf,lgbm_feats=c["sym"],c["sig"],c["dir"],c["price"],c["adv"],c["lgbm_conf"],c["lgbm_feats"]
         # 板塊分散：同板塊已有持倉就跳過這個候選，避免集中壓在同一個產業（如同時押好幾家金融股）
         this_sector=SECTOR_MAP.get(sym)
         if this_sector and this_sector in held_sectors: continue
@@ -1247,6 +1263,7 @@ def auto_trade_tick():
             "open_time":tw_now().strftime("%H:%M:%S"),
             "opened_at":time.time(),  # 數值時間戳，用於計算持倉分鐘數（短炒持倉時間上限判斷）
             "grade":grade,"regime":adv["regime"],"entry_reason":build_entry_reason(lgbm_conf,adv,dir_),
+            "lgbm_conf":round(lgbm_conf,1),"features":dict(zip(ML_FEATURE_NAMES,lgbm_feats)) if lgbm_feats else {},
         })
         act=sj.constant.Action.Buy if dir_=="L" else sj.constant.Action.Sell
         _place_real_order(sym,act,qty)
@@ -1305,7 +1322,9 @@ def force_close_all():
                 "entry_reason":pos.get("entry_reason","-"),"exit_reason":"13:20當沖規定強制平倉，不留倉過夜",
             })
             auto_state["trade_history"]=auto_state["trade_history"][:50]
-            if auto_state.get("paper_mode"): _record_paper_validation(net_pnl,pp_fc)
+            if auto_state.get("paper_mode"):
+                _record_paper_validation(net_pnl,pp_fc)
+                _record_feature_log(sym,pos,net_pnl,pp_fc,"強制平倉")
         except Exception as e:
             logger.warning(f"強制平倉{sym}損益計算失敗（委託仍會送出）: {e}")
         act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
@@ -1610,6 +1629,21 @@ async def auto_status():
 async def get_paper_validation():
     """真實下單前的模擬驗證進度，供前端顯示「還差幾筆/幾天」"""
     return _paper_validation_progress()
+
+@app.get("/auto/feature_log.csv")
+async def export_feature_log():
+    """匯出累積的特徵紀錄成CSV，供5天驗證期結束後做SHAP特徵歸因分析(見analyze_shap.py)。
+    每一列是一筆實際發生的交易：進場當時餵給LightGBM的完整特徵向量+這筆交易的結果(pnl/win)。"""
+    log=auto_state.get("feature_log",[])
+    if not log:
+        return Response(content="沒有資料，至少要有一筆模擬交易平倉後才會有紀錄\n",media_type="text/plain")
+    fieldnames=["ts","sym","tag","lgbm_conf","pnl","pct","win"]+ML_FEATURE_NAMES
+    buf=io.StringIO()
+    writer=csv.DictWriter(buf,fieldnames=fieldnames,extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(log)
+    return Response(content=buf.getvalue(),media_type="text/csv",
+                     headers={"Content-Disposition":"attachment; filename=paper_test_data.csv"})
 
 @app.put("/auto/watchlist")
 async def update_watchlist(watchlist:List[str]):
