@@ -1213,9 +1213,14 @@ def auto_trade_tick():
     # 但同時開好幾筆疊加起來總曝險還是過大(高風險max_pos=8時，理論上8筆*20%alloc=160%，沒有總量上限的話會嚴重超額)
     total_exposure=sum(p["entry"]*p["qty"]*1000 for p in auto_state["positions"])
     MAX_AGGREGATE_EXPOSURE_PCT=30
+    # 風控新增：單次30秒週期最多開2檔新倉，跟max_pos(總同時持倉上限)是不同的限制——
+    # 如果同一個tick有3、5檔同時信心度達標(例如台指期突然暴衝)，全部一次性送單會放大滑價跟頻寬延遲，
+    # 只取當下排序後最強的1~2檔進場，其餘留給下一個30秒週期重新評估，不是浪費機會，是控制單次衝擊。
+    MAX_NEW_ENTRIES_PER_TICK=2
     for c in candidates:
         if len(auto_state["positions"])>=cfg["max_pos"]: break
         if auto_state["daily_trades"]>=MAX_TRADES_PER_DAY: break  # 風控新增：當日交易次數上限，避免訊號反覆觸發過度交易
+        if opened_this_tick>=MAX_NEW_ENTRIES_PER_TICK: break
         sym,sig,dir_,p,adv,lgbm_conf=c["sym"],c["sig"],c["dir"],c["price"],c["adv"],c["lgbm_conf"]
         # 板塊分散：同板塊已有持倉就跳過這個候選，避免集中壓在同一個產業（如同時押好幾家金融股）
         this_sector=SECTOR_MAP.get(sym)
