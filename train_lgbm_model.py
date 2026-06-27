@@ -253,7 +253,12 @@ def extract_ml_features(sym, prices, volumes, entries, dir_="L", market_return_5
     mtf=multi_timeframe_direction(entries)
     vq=volume_quality_score(volumes,entries)
     of=approx_order_flow(entries)
-    orb=orb_range(entries,tw_now().strftime("%Y-%m-%d"))
+    # 修正：原本用tw_now()(腳本執行當下的真實日期)當作要找的「開盤區間日期」，但訓練樣本
+    # 幾乎都是過去90天內的歷史資料，幾乎不可能等於腳本執行那一天，等於orb_range永遠找不到
+    # 對應的09:00-09:15區間，這個特徵在訓練資料裡實質上是常數0——改成用這個樣本點自己最新
+    # 一筆entry的時間戳反推當天日期，才能正確對應到每個歷史樣本「當天」的開盤區間。
+    sample_date = datetime.fromtimestamp(entries[-1]["t"],tz=TW_TZ).strftime("%Y-%m-%d") if entries else tw_now().strftime("%Y-%m-%d")
+    orb=orb_range(entries,sample_date)
     ma20=sig.get("ma20") or 1
     vwap=sig.get("vwap") or 1
     aligned=mtf.get("aligned_long") if dir_=="L" else mtf.get("aligned_short")
@@ -279,25 +284,45 @@ def extract_ml_features(sym, prices, volumes, entries, dir_="L", market_return_5
 
 def fetch_1min_bars(api, symbol, days):
     """抓真實1分鐘K棒，用來算特徵跟標籤。比main.py的_fetch_real_history抓更長的歷史，
-    因為訓練需要足量資料，不像即時推論只要暖機用最近120根。"""
+    因為訓練需要足量資料，不像即時推論只要暖機用最近120根。
+    修正：永豐kbars() API單次請求的日期範圍硬性上限是30天(超過直接回400錯誤)，
+    原本直接拿days(預設90)整段去問，全部都會失敗。改成切成多段(每段最多28天，
+    留一點安全邊界)分批抓，串接起來，單一段失敗不影響其他段(用上限附近的股票/區間
+    偶爾真的會有暫時性錯誤，沒必要因為一段壞掉就整支股票都沒資料)。"""
     contract = api.Contracts.Stocks.get(symbol)
     if not contract:
         print(f"  ⚠️ 找不到合約 {symbol}，跳過")
         return []
     end_d = tw_now()
     start_d = end_d - timedelta(days=days)
-    try:
-        kb = api.kbars(contract, start=start_d.strftime("%Y-%m-%d"), end=end_d.strftime("%Y-%m-%d"))
-    except Exception as e:
-        print(f"  ⚠️ 抓取{symbol}失敗: {e}")
-        return []
-    if not kb or not kb.ts:
+    CHUNK_DAYS = 28  # 永豐上限30天，留一點邊界避免邊界值問題
+    all_bars = []
+    chunk_start = start_d
+    failed_chunks = 0
+    total_chunks = 0
+    while chunk_start < end_d:
+        chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), end_d)
+        total_chunks += 1
+        try:
+            kb = api.kbars(contract, start=chunk_start.strftime("%Y-%m-%d"), end=chunk_end.strftime("%Y-%m-%d"))
+            if kb and kb.ts:
+                n = len(kb.ts)
+                all_bars.extend([{"ts": kb.ts[i]/1e9, "open": kb.Open[i], "high": kb.High[i], "low": kb.Low[i],
+                                   "close": kb.Close[i], "volume": kb.Volume[i]} for i in range(n)])
+        except Exception as e:
+            failed_chunks += 1
+            print(f"  ⚠️ {symbol} 區段{chunk_start.strftime('%Y-%m-%d')}~{chunk_end.strftime('%Y-%m-%d')}抓取失敗: {e}")
+        chunk_start = chunk_end
+    if not all_bars:
         print(f"  ⚠️ {symbol} 沒有歷史資料")
         return []
-    n = len(kb.ts)
-    bars = [{"ts": kb.ts[i]/1e9, "open": kb.Open[i], "high": kb.High[i], "low": kb.Low[i],
-             "close": kb.Close[i], "volume": kb.Volume[i]} for i in range(n)]
-    print(f"  ✓ {symbol}: {len(bars)}根1分K棒（{start_d.strftime('%Y-%m-%d')}~{end_d.strftime('%Y-%m-%d')}）")
+    # 不同段之間理論上不該重疊，但用timestamp去重+排序保險一點，避免邊界重複的那一根被算兩次
+    seen = {}
+    for b in all_bars:
+        seen[b["ts"]] = b
+    bars = sorted(seen.values(), key=lambda b: b["ts"])
+    status = "" if failed_chunks==0 else f"（{failed_chunks}/{total_chunks}段失敗，資料可能不完整）"
+    print(f"  ✓ {symbol}: {len(bars)}根1分K棒（{start_d.strftime('%Y-%m-%d')}~{end_d.strftime('%Y-%m-%d')}）{status}")
     return bars
 
 def label_triple_barrier(bars, start_idx):
@@ -337,10 +362,18 @@ def build_dataset(api, symbols, days, stride=5):
         prices_all = [b["close"] for b in bars]
         volumes_all = [b["volume"] for b in bars]
         n_samples_this_sym = 0
+        # 效能修正：原本傳入prices_all[:i+1]這種隨i線性變大的切片，i越後面切片越大(可以到上萬筆)，
+        # 但extract_ml_features內部的multi_timeframe_direction/approx_order_flow等函式其實只需要
+        # 最近一段時間的資料(MTF最多用到15分鐘=15根，ORB需要當天09:00-09:15的資料)，沒有界限的
+        # 切片等於每個樣本點都重新掃過整段歷史，是O(n²)的效能陷阱——46檔股票*每股3000+樣本點，
+        # 實測過完整跑下來要3小時以上。改成固定視窗(最近1500根，約5個交易日，遠超過任何一個
+        # 特徵函式實際需要的回看長度，包含ORB要找「當天」開盤區間也綽綽有餘)，實測快了超過15倍。
+        FEATURE_WINDOW = 1500
         for i in range(30, len(bars) - LABEL_MAX_HOLD_MIN - 1, stride):
+            w_start = max(0, i+1-FEATURE_WINDOW)
             mkt_ret = get_market_context_at(market_entries, market_ts_list, bars[i]["ts"])
             tod_pct = get_time_of_day_pct(bars[i]["ts"])
-            feats = extract_ml_features(sym, prices_all[:i+1], volumes_all[:i+1], entries[:i+1], "L", mkt_ret, tod_pct)
+            feats = extract_ml_features(sym, prices_all[w_start:i+1], volumes_all[w_start:i+1], entries[w_start:i+1], "L", mkt_ret, tod_pct)
             if feats is None: continue
             label = label_triple_barrier(bars, i)
             X.append(feats); y.append(label)
