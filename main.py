@@ -763,13 +763,18 @@ def _refresh_capital_from_account():
         balance=float(getattr(bal,"acc_balance",None) or getattr(bal,"balance",0))
         avail  =float(getattr(bal,"available_balance",None) or getattr(bal,"available",0))
         pending_settlement = 0.0
+        settlement_schedule = []  # [{"date":"YYYY-MM-DD","amount":float}, ...] 哪一天會交割多少錢的明細，不只是加總後的單一數字
         try:
             setts = sinopac_api.settlements(stock_account)
             today_str = tw_now().strftime("%Y-%m-%d")
             for s in setts:
                 t_date = str(getattr(s,"t_date","") or getattr(s,"date",""))
+                amt = abs(float(s.amount))
                 if t_date and t_date >= today_str:
-                    pending_settlement += abs(float(s.amount))
+                    pending_settlement += amt
+                    if amt > 0:
+                        settlement_schedule.append({"date":t_date,"amount":amt})
+            settlement_schedule.sort(key=lambda x:x["date"])
         except Exception as se:
             logger.warning(f"無法取得交割資料，風控將以可用餘額為準（未扣交割款）: {se}")
         available_after_settlement = max(0.0, avail - pending_settlement)
@@ -780,7 +785,8 @@ def _refresh_capital_from_account():
         auto_state["capital"]=available_after_settlement
         cap_info={"account":str(stock_account),"balance":balance,"available":avail,
                 "pending_settlement":pending_settlement,
-                "available_after_settlement":available_after_settlement}
+                "available_after_settlement":available_after_settlement,
+                "settlement_schedule":settlement_schedule}
         auto_state["capital_info"]=cap_info  # 持久化存起來，前端點"資金已同步"那行log時可以隨時查詢最新明細
         return cap_info
     except Exception as e:
