@@ -1,15 +1,24 @@
 """
 TradeAI Pro 後端 v2.0 — 24小時自動交易機器人
 台股時段：09:30-13:00主動交易 | 08:00盤前準備 | 13:00停開新倉 | 13:20強制平倉 | 14:30盤後總結
+
+模組拆分說明：原本這個檔案近2000行所有邏輯都擠在一起，現在拆成：
+  config.py   — 純常數、時間/假日工具、股票池/板塊對照表
+  db.py       — SQLite持久化
+  state.py    — 跨模組共用的price_cache(就地修改，不可整個重新賦值)
+  signals.py  — 技術指標/市場環境/OFI大單流引擎
+  ml_model.py — LightGBM特徵抽取/推論/動態部位縮放/進出場原因說明
+main.py本身保留：全域連線狀態(sinopac_api等會被整個重新賦值的物件)、auto_state交易狀態、
+交易引擎主迴圈、看門狗、全市場掃描、FastAPI所有路由——這些彼此高度耦合、且跟main.py的
+生命週期(誰連線了/誰啟動了自動交易)綁在一起，拆出去風險大於好處，刻意留在這裡。
 """
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 import shioaji as sj
-import os, logging, base64, tempfile, time, sqlite3, json, csv, io
+import os, logging, base64, tempfile, time, csv, io
 from datetime import datetime, timedelta
-import pytz
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -17,751 +26,30 @@ from apscheduler.triggers.cron import CronTrigger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ══════════════════════════════════════════════════════════════════
-# 資料庫持久化（SQLite + Railway Volume）
-# 重要：必須在 Railway 後台幫這個服務「掛載一個 Volume」，路徑設為 /data，
-# 否則資料庫檔案還是會在每次重新部署時被清空（跟之前記憶體版本同樣的問題）。
-# 沒有掛 Volume 時會自動退回容器內的暫存路徑，程式仍可正常運作，只是一樣不會跨部署保留。
-# ══════════════════════════════════════════════════════════════════
-DB_PATH = "/data/tradeai.db" if os.path.isdir("/data") else "/tmp/tradeai.db"
-
-def db_init():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
-    conn.commit()
-    conn.close()
-    using_volume = os.path.isdir("/data")
-    logger.info(f"資料庫已初始化：{DB_PATH}（{'已使用Railway Volume，跨部署保留' if using_volume else '未掛載Volume，重新部署仍會清空'}）")
-
-def db_save(key: str, value: dict):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("INSERT INTO kv_store (key,value,updated_at) VALUES (?,?,?) "
-                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                     (key, json.dumps(value), datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.warning(f"資料庫寫入失敗 [{key}]: {e}")
-
-def db_load(key: str, default=None):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        row = conn.execute("SELECT value FROM kv_store WHERE key=?", (key,)).fetchone()
-        conn.close()
-        if row: return json.loads(row[0])
-    except Exception as e:
-        logger.warning(f"資料庫讀取失敗 [{key}]: {e}")
-    return default
+from db import db_init, db_save, db_load
+from config import (
+    TW_TZ, tw_now, FEE_RATE, FEE_DISCOUNT, DAYTRADE_TAX_RATE,
+    calc_round_trip_cost, min_profitable_move_pct,
+    market_status, is_trading_time, can_open_new_position,
+    SCAN_UNIVERSE, SECTOR_MAP,
+    PAPER_VALIDATION_MIN_TRADES, PAPER_VALIDATION_MIN_DAYS,
+    MAX_TRADES_PER_DAY, CONSEC_LOSS_STOP,
+    max_allowed_spread_pct, next_settlement_date,
+)
+from state import price_cache
+from signals import (
+    calc_signal_py, is_no_trade_zone, advanced_score,
+    MARKET_INDEX_SYMBOL, get_market_context,
+    subscribe_ofi_symbols, unsubscribe_all_ofi, get_latest_spread_pct,
+    _on_tick_stk_v1, _on_bidask_stk_v1, _flush_all_ofi,
+)
+from ml_model import (
+    ML_FEATURE_NAMES, predict_lgbm_confidence,
+    lgbm_grade, calculate_dynamic_position_ratio,
+    build_entry_reason, build_exit_reason,
+)
 
 db_init()
-TW_TZ = pytz.timezone('Asia/Taipei')
-
-# ══════════════════════════════════════════════════════════════════
-# 台股當沖真實交易成本（含手續費+證交稅，2026年現行費率）
-# ══════════════════════════════════════════════════════════════════
-FEE_RATE = 0.001425      # 手續費 0.1425%（買賣各收一次，未打折）
-FEE_DISCOUNT = 0.6       # 一般網路下單券商折扣約6折
-DAYTRADE_TAX_RATE = 0.0015  # 當沖證交稅 0.15%（優惠至2027年底，賣出收一次）
-
-def calc_round_trip_cost(entry_price:float, exit_price:float, qty:int) -> dict:
-    """計算當沖一買一賣的真實成本（手續費x2 + 當沖證交稅）"""
-    buy_amt  = entry_price*qty
-    sell_amt = exit_price*qty
-    buy_fee  = max(20, buy_amt*FEE_RATE*FEE_DISCOUNT)
-    sell_fee = max(20, sell_amt*FEE_RATE*FEE_DISCOUNT)
-    tax      = sell_amt*DAYTRADE_TAX_RATE
-    total_cost = buy_fee+sell_fee+tax
-    gross_pnl  = sell_amt-buy_amt
-    net_pnl    = gross_pnl-total_cost
-    return {"gross_pnl":gross_pnl,"total_cost":total_cost,"net_pnl":net_pnl,
-            "buy_fee":buy_fee,"sell_fee":sell_fee,"tax":tax}
-
-def min_profitable_move_pct() -> float:
-    """當沖至少要漲跌多少%才能扣成本後還有獲利（含手續費折扣後約0.32%）"""
-    return (FEE_RATE*FEE_DISCOUNT*2 + DAYTRADE_TAX_RATE)*100
-
-# ══════════════════════════════════════════════════════════════════
-# 台股時段工具
-# ══════════════════════════════════════════════════════════════════
-def tw_now():
-    return datetime.now(TW_TZ)
-
-# ══════════════════════════════════════════════════════════════════
-# 國定假日休市表：原本只用 weekday()>=5 排掉週末，國定假日（春節、228、兒童節等）落在平日時
-# 會被誤判成「開盤」，導致系統那天繼續嘗試交易，可能拿到空/過期的歷史資料卻誤判出訊號。
-# 資料來源：證交所「市場開休市日期」官方公告(2026/115年)，僅收錄會落在平日、真正需要額外排除的休市日；
-# 春節連假已知是落在平日的部分（2/16~2/20）跟結算日(2/12,2/13)都包含在內。
-# 注意：這份清單需要每年手動更新一次（通常證交所會在前一年底公布次年行事曆）。
-# ══════════════════════════════════════════════════════════════════
-TW_MARKET_HOLIDAYS = {
-    2026: {
-        "2026-01-01",  # 元旦
-        "2026-02-12","2026-02-13",  # 春節前結算交割（無交易）
-        "2026-02-16","2026-02-17","2026-02-18","2026-02-19","2026-02-20",  # 農曆春節（含補假）
-        "2026-02-27","2026-02-28",  # 228和平紀念日（含補假）
-        "2026-04-03","2026-04-04","2026-04-06",  # 兒童節/民族掃墓節（含補假，4/5本身是週日）
-        "2026-05-01",   # 勞動節
-        "2026-06-19",   # 端午節
-        "2026-09-25",   # 中秋節
-        "2026-09-28",   # 教師節
-        "2026-10-09","2026-10-10",  # 國慶日（含補假）
-        "2026-10-26",   # 臺灣光復暨金門古寧頭大捷紀念日補假（10/25本身是週日）
-        "2026-12-25",   # 行憲紀念日
-    },
-}
-_holiday_warn_logged_years=set()
-
-def is_tw_market_holiday(now=None) -> bool:
-    """檢查是否為國定假日休市（不含週末，週末由market_status另外的weekday()檢查處理）"""
-    now=now or tw_now()
-    year=now.year
-    if year not in TW_MARKET_HOLIDAYS and year not in _holiday_warn_logged_years:
-        _holiday_warn_logged_years.add(year)
-        logger.warning(f"⚠️ 尚未維護{year}年的國定假日清單(TW_MARKET_HOLIDAYS)，目前無法排除國定假日造成的誤判，請更新代碼")
-    return now.strftime("%Y-%m-%d") in TW_MARKET_HOLIDAYS.get(year,set())
-
-def market_status() -> dict:
-    now = tw_now()
-    if now.weekday() >= 5:
-        return {"status": "closed", "session": "weekend", "label": "週末休市"}
-    if is_tw_market_holiday(now):
-        return {"status": "closed", "session": "holiday", "label": "國定假日休市"}
-    t = now.hour * 60 + now.minute
-    if   t < 8*60+30:     return {"status":"closed",     "session":"before_market",    "label":"盤前"}
-    elif t < 9*60:         return {"status":"pre_market",  "session":"order_collection", "label":"委託收集 08:30-09:00"}
-    elif t < 9*60+30:      return {"status":"open_vol",    "session":"opening_volatile", "label":"開盤波動期 09:00-09:30（只監控）"}
-    elif t < 13*60:        return {"status":"open",        "session":"regular_trading",  "label":"主動交易 09:30-13:00"}
-    elif t < 13*60+20:     return {"status":"open_late",   "session":"late_trading",     "label":"尾盤監控 13:00-13:20（不開新倉）"}
-    elif t < 13*60+25:     return {"status":"closing",     "session":"force_close",      "label":"強制平倉 13:20-13:25"}
-    elif t < 13*60+30:     return {"status":"closing",     "session":"closing_auction",  "label":"收盤集合競價 13:25-13:30"}
-    elif t < 14*60+30:     return {"status":"after",       "session":"after_market",     "label":"盤後定價 13:30-14:30"}
-    elif t < 21*60:        return {"status":"closed",      "session":"analysis",         "label":"資料分析時段"}
-    elif t < 23*60:        return {"status":"closed",      "session":"ml_training",      "label":"ML訓練時段 21:00-23:00"}
-    else:                  return {"status":"closed",      "session":"idle",             "label":"休眠"}
-
-def is_trading_time() -> bool:
-    return market_status()["status"] == "open"
-
-def can_open_new_position() -> bool:
-    """只有主動交易時段才開新倉（09:30-13:00）"""
-    return market_status()["status"] == "open"
-
-def should_force_close() -> bool:
-    """13:20-13:25強制平倉所有部位"""
-    return market_status()["session"] == "force_close"
-
-# ══════════════════════════════════════════════════════════════════
-# Python 信號引擎 v3（與前端 calcSignal 邏輯一致）
-# ══════════════════════════════════════════════════════════════════
-def _calc_rsi(prices: List[float], period: int = 14) -> List[float]:
-    if len(prices) < period + 1:
-        return [50.0] * len(prices)
-    result = [50.0] * period
-    for i in range(period, len(prices)):
-        w = prices[i-period:i+1]
-        g = [max(0, w[j]-w[j-1]) for j in range(1, len(w))]
-        l = [max(0, w[j-1]-w[j]) for j in range(1, len(w))]
-        ag, al = sum(g)/period, sum(l)/period
-        result.append(100.0 if al==0 else 100-100/(1+ag/al))
-    return result
-
-def _ema(data: List[float], n: int) -> List[float]:
-    k, r = 2/(n+1), [data[0]]
-    for p in data[1:]: r.append(p*k + r[-1]*(1-k))
-    return r
-
-def calc_signal_py(prices: List[float], volumes: List[float]) -> Dict:
-    """完整信號計算（12個指標 + 趨勢過濾）"""
-    if len(prices) < 30:
-        return {"action":"hold","conf":50,"rsi":50}
-    price = prices[-1]
-    ma5   = sum(prices[-5:])/5
-    ma20  = sum(prices[-20:])/20
-    ma50  = sum(prices[-50:])/50 if len(prices)>=50 else ma20
-
-    rsi_arr   = _calc_rsi(prices)
-    rsi       = rsi_arr[-1]
-    rsi_win   = rsi_arr[-14:]
-    rmin,rmax = min(rsi_win),max(rsi_win)
-    stoch_rsi = (rsi-rmin)/(rmax-rmin)*100 if rmax>rmin else 50
-
-    vp,vv     = prices[-20:], (volumes[-20:] if volumes else [1e6]*20)
-    total_v   = sum(vv) or 1
-    vwap      = sum(p*v for p,v in zip(vp,vv))/total_v
-    mean20    = ma20
-    var       = sum((p-mean20)**2 for p in prices[-20:])/20
-    bb_upper  = mean20+2*var**0.5
-    bb_lower  = mean20-2*var**0.5
-    bb_pct    = (price-bb_lower)/(bb_upper-bb_lower or 1)
-    avg_vol   = sum(volumes[-20:])/20 if volumes else 1
-    vol_ratio = (sum(volumes[-3:])/3 if volumes else 1)/avg_vol
-
-    fresh_golden=fresh_death=False
-    macd_val=sig_val=0
-    if len(prices)>=26:
-        e12=_ema(prices,12); e26=_ema(prices,26)
-        ml=[a-b for a,b in zip(e12[-9:],e26[-9:])]
-        sl2=_ema(ml,9); macd_val,sig_val=ml[-1],sl2[-1]
-        if len(ml)>1:
-            fresh_golden=macd_val>sig_val and ml[-2]<=sl2[-2]
-            fresh_death =macd_val<sig_val and ml[-2]>=sl2[-2]
-
-    ws=prices[-14:]; wh,wl=max(ws),min(ws)
-    w_r=-(wh-price)/(wh-wl)*100 if wh!=wl else -50
-    cs=prices[-20:]; cm=sum(cs)/20; cd=sum(abs(p-cm) for p in cs)/20 or 1
-    cci=(price-cm)/(0.015*cd)
-    r14=prices[-14:]; mp,np2=max(r14),min(r14)
-    am=sum(abs(r14[i]-r14[i-1]) for i in range(1,len(r14)))/13 or 1
-    trend_str=min(1.0,(mp-np2)/(am*14))
-    up_trend  = ma5>ma20 and ma20>ma50
-    down_trend= ma5<ma20 and ma20<ma50
-    t=tw_now(); tm=t.hour*60+t.minute
-    # 與前端一致：09:00-09:30開盤亂流不進場、13:00後不開新倉，12:00-13:00午盤降權但不完全禁止
-    bad_time  = tm<9*60+30 or tm>=13*60
-    low_quality = 12*60<=tm<13*60
-
-    bull=bear=0.0
-    if rsi<25:bull+=20
-    elif rsi<33:bull+=13
-    elif rsi<42:bull+=6
-    elif rsi>75:bear+=20
-    elif rsi>67:bear+=13
-    elif rsi>58:bear+=6
-    if fresh_golden:bull+=25
-    elif fresh_death:bear+=25
-    elif macd_val>sig_val:bull+=11
-    else:bear+=11
-    if ma5>ma20:bull+=20
-    else:bear+=20
-    if price>vwap*1.002:bull+=12
-    elif price<vwap*0.998:bear+=12
-    else:bull+=5;bear+=5
-    if bb_pct<0.12:bull+=8
-    elif bb_pct<0.25:bull+=4
-    elif bb_pct>0.88:bear+=8
-    elif bb_pct>0.75:bear+=4
-    if vol_ratio>1.8 and bull>bear:bull+=8
-    elif vol_ratio>1.8 and bear>bull:bear+=8
-    elif vol_ratio<0.6:bull*=0.85;bear*=0.85
-    if w_r<-80:bull+=6
-    elif w_r<-60:bull+=3
-    elif w_r>-20:bear+=6
-    elif w_r>-40:bear+=3
-    if cci<-100:bull+=5
-    elif cci<-50:bull+=2
-    elif cci>100:bear+=5
-    elif cci>50:bear+=2
-    if trend_str>0.65:
-        if ma5>ma20:bull+=7
-        else:bear+=7
-    if up_trend and bull>bear:bull*=1.15
-    elif down_trend and bear>bull:bear*=1.15
-    elif up_trend and bear>bull:bear*=0.70
-    elif down_trend and bull>bear:bull*=0.70
-    if bad_time:bull*=0.72;bear*=0.72
-    if low_quality:bull*=0.85;bear*=0.85
-
-    total=bull+bear or 1
-    bp=bull/total*100
-    action="buy" if bp>=67 else "sell" if bp<=33 else "hold"
-    conf=min(95, bp if action=="buy" else 100-bp if action=="sell" else 50)
-    return {"action":action,"conf":round(conf,1),"rsi":round(rsi,1),
-            "ma5":round(ma5,2),"ma20":round(ma20,2),"vwap":round(vwap,2),
-            "williams_r":round(w_r,1),"cci":round(cci,1),"trend_str":round(trend_str,2),
-            "vol_ratio":round(vol_ratio,2),
-            "bull":round(bull,1),"bear":round(bear,1),
-            "up_trend":up_trend,"down_trend":down_trend,"bad_time":bad_time}
-
-# ══════════════════════════════════════════════════════════════════
-# 進階訊號引擎（依使用者提供的規格書整合，Phase 1：只用既有OHLCV資料就能算的部分）
-#
-# 沒做的部分(Phase 2/3，需要額外資料來源，先誠實列出，不假裝已經做了)：
-#   - Order Flow Engine (Delta/CVD/Absorption)：需要逐筆成交+委託簿(tick/bidask)資料，
-#     目前只訂閱/輪詢一般報價快照，沒有接這類資料源。
-#   - Volume Quality裡的 Large Order Ratio、Bid-Ask Imbalance：同樣需要逐筆/委託簿資料。
-#   - ML「Trade Quality」重新訓練 + Meta Model：需要足量已標記的歷史交易結果才能訓練，
-#     目前真實交易/模擬交易的歷史筆數還太少（剛好是上次加的20筆驗證門檻在保護的東西）。
-#   - 重大新聞前/法說會前：需要公司行事曆或新聞源，目前沒有接這類資料。
-#
-# 設計上跟原規格書不同的地方（刻意，不是漏改）：
-#   - 原規格「最終進場條件」要求12個條件同時成立(AND)。實際測過，這樣的門檻配上我們刻意選的
-#     低波動銀行股池，幾乎不會有任何訊號通過(多個條件各自過關率不到100%，乘起來機率極低)。
-#     改成「加權總分」(下面 advanced_score)，精神一樣(多因子都要有一定水準才給高分)，
-#     但不會因為單一條件沒過就整個歸零，避免策略變成永遠不交易。
-# ══════════════════════════════════════════════════════════════════
-
-def _entry_ts(e:Dict) -> Optional[float]:
-    """價格快取裡每筆紀錄的時間戳(epoch秒)，舊資料/還沒補時間戳的情況回傳None"""
-    return e.get("t")
-
-def classify_market_regime(prices: List[float]) -> Dict:
-    """市場環境分類：trending_bull / trending_bear / range / volatile / panic
-    用近20筆報酬率標準差(波動度代用ATR)+近14筆趨勢強度(複用calc_signal_py同一套算法)分類，
-    不需要額外資料來源。門檻是合理起點，沒有經過正式校準，建議之後拿真實交易結果回頭驗證調整。"""
-    if len(prices) < 20:
-        return {"regime":"unknown","confidence":0}
-    rets=[(prices[i]-prices[i-1])/prices[i-1] for i in range(1,len(prices)) if prices[i-1]]
-    recent=rets[-20:]
-    if not recent: return {"regime":"unknown","confidence":0}
-    mean_r=sum(recent)/len(recent)
-    vol=(sum((r-mean_r)**2 for r in recent)/len(recent))**0.5
-    ws=prices[-14:]; am=sum(abs(ws[i]-ws[i-1]) for i in range(1,len(ws)))/13 or 1
-    trend_strength=min(1.0,abs(prices[-1]-prices[-14])/(am*13)) if len(prices)>=14 else 0
-    cum_ret=(prices[-1]-prices[-10])/prices[-10] if len(prices)>=10 and prices[-10] else 0
-    PANIC_VOL,VOLATILE_VOL,TREND_TH=0.012,0.007,0.4
-    if vol>=PANIC_VOL and cum_ret<=-0.02:
-        return {"regime":"panic","confidence":min(100,round(vol/PANIC_VOL*60)),"vol":round(vol,4)}
-    if vol>=VOLATILE_VOL:
-        return {"regime":"volatile","confidence":min(100,round(vol/VOLATILE_VOL*55)),"vol":round(vol,4)}
-    if trend_strength>=TREND_TH and cum_ret>0:
-        return {"regime":"trending_bull","confidence":round(trend_strength*100),"vol":round(vol,4)}
-    if trend_strength>=TREND_TH and cum_ret<0:
-        return {"regime":"trending_bear","confidence":round(trend_strength*100),"vol":round(vol,4)}
-    return {"regime":"range","confidence":round((1-trend_strength)*100),"vol":round(vol,4)}
-
-def _bucket_closes(entries:List[Dict], bucket_seconds:int) -> List[float]:
-    """把有時間戳的價格序列依固定秒數分桶，每桶取最後一筆當「收盤價」，近似聚合出較大時間框架的K線收盤序列"""
-    buckets={}
-    for e in entries:
-        ts=_entry_ts(e)
-        if ts is None: continue
-        buckets[int(ts//bucket_seconds)]=e["price"]
-    return [buckets[k] for k in sorted(buckets.keys())]
-
-def multi_timeframe_direction(entries:List[Dict]) -> Dict:
-    """用price_cache裡的時間戳，分桶聚合成近似1分/5分/15分收盤序列，檢查三個時間框架方向是否一致。
-    資料不足(例如剛啟動、還沒累積15分鐘的歷史)時對應框架回報unknown，aligned_long/short會是None(不確定)，
-    不會被當成「自動算過關」——呼叫端要把None當成中性看待，不是當成True。"""
-    m1,m5,m15=_bucket_closes(entries,60),_bucket_closes(entries,300),_bucket_closes(entries,900)
-    def direction(closes,lookback):
-        if len(closes)<lookback+1: return "unknown"
-        base=closes[-1-lookback]
-        if not base: return "unknown"
-        chg=(closes[-1]-base)/base
-        return "bull" if chg>0.001 else "bear" if chg<-0.001 else "flat"
-    d15,d5,d1=direction(m15,2),direction(m5,3),direction(m1,2)
-    def _aligned(forbidden):
-        knowns=[d for d in (d15,d5,d1) if d!="unknown"]
-        if not knowns: return None  # 完全沒資料可判斷，回傳None(不確定)，不要預設True或False
-        return all(d!=forbidden for d in knowns)
-    return {"d15":d15,"d5":d5,"d1":d1,
-            "aligned_long":_aligned("bear"),
-            "aligned_short":_aligned("bull")}
-
-def orb_range(entries:List[Dict], date_str:str) -> Optional[Dict]:
-    """取得當天09:00~09:15開盤區間的高低點(ORB)。沒有當天時間戳資料(例如太晚才連線、price_cache還沒暖機到含這段)回傳None"""
-    morning=[]
-    for e in entries:
-        ts=_entry_ts(e)
-        if ts is None: continue
-        dt=datetime.fromtimestamp(ts,tz=TW_TZ)
-        if dt.strftime("%Y-%m-%d")==date_str and 9*60<=dt.hour*60+dt.minute<9*60+15:
-            morning.append(e["price"])
-    if not morning: return None
-    return {"high":max(morning),"low":min(morning)}
-
-def volume_quality_score(volumes: List[float], entries:Optional[List[Dict]]=None) -> Dict:
-    """成交量品質分數(0~100)。Phase 1只有Volume Ratio+Relative Volume；
-    Phase 2新增Bid-Ask Imbalance(用snapshot的buy_vol/sell_vol欄位，不需要額外訂閱)。
-    Large Order Ratio仍然沒做：那個需要看每一筆成交的實際大小去分類「大單」，
-    snapshot只給我們最後一筆成交+目前委買委賣量，看不到整天的逐筆成交分佈，
-    沒有訂閱tick資料流的話沒辦法做這個，不是不想做，是現有資料真的算不出來。"""
-    if len(volumes)<20: return {"score":50.0,"note":"資料不足，給中性分數"}
-    avg20=sum(volumes[-20:])/20 or 1
-    vol_ratio=(sum(volumes[-3:])/3)/avg20
-    baseline=sum(volumes[-60:])/60 if len(volumes)>=60 else avg20
-    rel_vol=avg20/(baseline or 1)
-    bai=bid_ask_imbalance(entries) if entries else {"imbalance":0.0,"note":"無資料"}
-    # 買賣力道失衡(-1~1)轉成0~100分：失衡越偏多方(正值)分數越高
-    bai_score=50+bai["imbalance"]*50
-    score=min(100.0,max(0.0,40*min(vol_ratio,2)+20*min(rel_vol,2)+0.4*bai_score))
-    return {"score":round(score,1),"vol_ratio":round(vol_ratio,2),"rel_vol":round(rel_vol,2),
-            "bid_ask_imbalance":bai["imbalance"],
-            "note":"未含Large Order Ratio(需逐筆成交明細，僅snapshot資料無法計算)"}
-
-def bid_ask_imbalance(entries: List[Dict]) -> Dict:
-    """買賣力道失衡：用snapshot的委買量(buy_vol)/委賣量(sell_vol)算，近10筆平均，範圍-1~1。
-    這是目前最佳買賣各一檔的委託量比較，不是逐筆成交流，但不需要額外訂閱tick/bidask資料流就能算，
-    每30秒輪詢時snapshot本來就會回傳這兩個欄位。"""
-    recent=[e for e in entries[-10:] if e.get("buy_vol") is not None and e.get("sell_vol") is not None]
-    if not recent: return {"imbalance":0.0,"note":"無資料"}
-    vals=[(e["buy_vol"]-e["sell_vol"])/((e["buy_vol"]+e["sell_vol"]) or 1) for e in recent]
-    return {"imbalance":round(sum(vals)/len(vals),3),"n":len(recent)}
-
-def approx_order_flow(entries: List[Dict]) -> Dict:
-    """用snapshot的tick_type(最近一筆成交是外盤買進/內盤賣出)＋每筆紀錄本身的區間成交量(volume欄位，
-    現在統一是「這段期間的增量」，不是累計量——見_update_cache的修正)，近似估算Delta(買賣力道淨額)/CVD(累積Delta)。
-    重要警示：這是「輪詢近似」，不是真正逐筆Delta——30秒之間發生的所有成交，我們只看得到
-    輪詢當下最後一筆的方向，中間被吃掉的買賣力道完全看不到，所以這個值有偏差，只能當參考，
-    不是精確值。真正精確的Delta/CVD需要訂閱tick資料流逐筆累加，這裡沒有做(見上方說明)。"""
-    deltas=[]
-    for e in entries:
-        vol=e.get("volume")
-        if vol is None or vol<=0: continue
-        tt=e.get("tick_type",0)
-        sign=1 if tt==1 else (-1 if tt==2 else 0)
-        deltas.append(sign*vol)
-    if not deltas: return {"cvd":0,"delta_recent":0,"note":"無逐筆方向資料(僅輪詢近似，非精確值)"}
-    return {"cvd":sum(deltas),"delta_recent":sum(deltas[-10:]),"note":"輪詢近似值，非精確逐筆Delta"}
-
-def detect_absorption(prices: List[float], entries: List[Dict]) -> Dict:
-    """規格書第六層的「假突破偵測」概念：價格創近期新高，但買賣力道(Delta)沒有同步增加甚至衰退，
-    判定為可能的假突破(Potential Fake Breakout)。用approx_order_flow算的近似Delta，
-    精準度受限於上面說明的輪詢近似問題，當作風險警示用，不是100%準確的判定。"""
-    if len(prices)<15: return {"fake_breakout_risk":False}
-    making_new_high=prices[-1]>=max(prices[-15:-1])
-    of=approx_order_flow(entries[-15:])
-    return {"fake_breakout_risk":making_new_high and of["delta_recent"]<=0,
-            "delta_recent":of["delta_recent"],"note":of["note"]}
-
-# ══════════════════════════════════════════════════════════════════
-# 模組一：即時大單流 OFI 引擎（真逐筆tick/bidask訂閱，取代上面approx_order_flow的輪詢近似版）
-#
-# 重要更正：一開始我以為Tick資料本身就有bid_price/ask_price可以用，省掉另外訂閱BidAsk——
-# 這是錯的。我去查證Shioaji官方文件完整欄位列表後發現，TickSTKv1根本沒有bid_price/ask_price
-# 這些欄位(它只有volume/tick_type/bid_side_total_vol這類彙總資訊)，bid_price/bid_volume/
-# ask_price/ask_volume只存在於另一條獨立的BidAskSTKv1資料流。所以這裡需要分開訂閱+處理：
-#   - Tick資料流(TickSTKv1)：volume(這筆成交量) + tick_type(1=外盤買進 2=內盤賣出) → 算大單流
-#   - BidAsk資料流(BidAskSTKv1)：bid_price/bid_volume/ask_price/ask_volume(五檔，這裡只用最佳一檔)
-#     → 算OFI(委託簿不平衡)
-# 使用者參考文件裡的tick格式(bid_p1/bid_v1/is_market_buy合併在一個tick裡)是範例性質的假格式，
-# 不是Shioaji真正的資料結構，已經改成上面查證過的真實雙資料流設計。
-#
-# ⚠️ 跟之前所有Phase1/2引擎一樣的免責聲明：這段程式碼沒有真實永豐連線測試過，
-# 欄位名稱/訂閱語法都查證自官方文件並對照過真實範例輸出，但實際訂閱/callback行為
-# （會不會準時收到、46檔×2條資料流=92個訂閱會不會卡額度、斷線重連)沒有人驗證過。
-# 上線後第一件事是看log確認「OFI訂閱成功N/M檔」，並觀察是否持續收到tick/bidask更新。
-# ══════════════════════════════════════════════════════════════════
-class RealTimeOFI:
-    """單一股票的即時大單流計算器。OFI跟大單流分別來自BidAsk跟Tick兩條不同資料流(見上方說明)。
-    修正：原本用EMA/衰減加總平滑，但這樣「現在讀到的值」混雜了好幾個30秒週期以前的資訊，
-    跟決策引擎每30秒才讀一次的節奏對不齊。改成「累積這個週期內的所有事件，被讀取(flush)時
-    立刻歸零，開始累積下一個週期」——這樣每次決策拿到的就是「乾乾淨淨剛剛這30秒發生的事」，
-    跟bad_time/no_trade_zone這些每30秒重新評估一次的其他風控邏輯節奏一致。"""
-    def __init__(self, big_trade_threshold:int=50):
-        self.big_trade_threshold=big_trade_threshold  # 台股大單張數門檻，預設單筆超過50張算大單
-        self._prev_bidask=None       # 上一筆BidAsk最佳一檔快照，算OFI delta用(不隨週期重置，要連續比較)
-        self.interval_ofi=0.0        # 這個週期內累積的OFI
-        self.interval_big_trade=0.0  # 這個週期內累積的大單流
-
-    def update_bidask(self, bidask):
-        """bidask是Shioaji的BidAskSTKv1物件，把這次更新的OFI累加進這個週期的累積值"""
-        cur={"bid_price":float(bidask.bid_price[0]),"bid_volume":int(bidask.bid_volume[0]),
-             "ask_price":float(bidask.ask_price[0]),"ask_volume":int(bidask.ask_volume[0])}
-        prev=self._prev_bidask
-        self._prev_bidask=cur
-        if prev is None: return  # 第一筆沒有對照，跳過這次(不影響累積值)
-        # OFI核心公式：買一價上漂等於買方掛單整批新增，賣一價下跌等於賣方掛單整批新增，
-        # 價格不變則看掛單量的淨變化；買方淨增量-賣方淨增量
-        if cur["bid_price"]>prev["bid_price"]: delta_bid=cur["bid_volume"]
-        elif cur["bid_price"]==prev["bid_price"]: delta_bid=cur["bid_volume"]-prev["bid_volume"]
-        else: delta_bid=0
-        if cur["ask_price"]<prev["ask_price"]: delta_ask=cur["ask_volume"]
-        elif cur["ask_price"]==prev["ask_price"]: delta_ask=cur["ask_volume"]-prev["ask_volume"]
-        else: delta_ask=0
-        self.interval_ofi+=float(delta_bid-delta_ask)
-
-    def update_tick(self, tick):
-        """tick是Shioaji的TickSTKv1物件，把這筆成交的大單流(若有)累加進這個週期的累積值。
-        修正(感謝使用者文件提醒)：tick_type==0(無法判定/集合競價)原本被歸進else當成賣出方向算，
-        這是錯的——無法判定不等於賣出，應該完全不計入方向，否則會把中性事件誤判成賣壓。"""
-        vol=int(tick.volume)
-        if vol<self.big_trade_threshold: return
-        tt=int(tick.tick_type)
-        if tt==1: self.interval_big_trade+=float(vol)        # 外盤(買方主動敲進)
-        elif tt==2: self.interval_big_trade-=float(vol)       # 內盤(賣方主動殺出)
-        # tt==0(無法判定)：不計入，維持原值不變
-
-    def flush(self) -> Tuple[float,float]:
-        """由_update_cache每30秒呼叫一次：取出這個週期累積的(ofi, big_trade)，並立刻歸零開始下一輪。
-        _prev_bidask不歸零，因為那是用來比較「下一筆bidask跟上一筆」的連續狀態，不是週期累積值。"""
-        ofi,big_trade=self.interval_ofi,self.interval_big_trade
-        self.interval_ofi=0.0; self.interval_big_trade=0.0
-        return ofi,big_trade
-
-_ofi_engines: Dict[str,"RealTimeOFI"] = {}
-_ofi_latest: Dict[str,Dict] = {}     # {sym: {"ofi":上一個完整30秒週期的OFI累積值, "big_trade":同期大單流累積值, "updated_at":epoch秒}}
-_ofi_subscribed: set = set()         # 已成功訂閱tick+bidask的股票，避免重複訂閱
-
-def _on_bidask_stk_v1(exchange, bidask):
-    """Shioaji BidAsk callback：訂閱股票的委託簿(五檔)有變動就會被呼叫一次，事件驅動、隨時觸發。
-    注意：跑在Shioaji自己的內部執行緒，這裡只做簡單累加，不做重運算/I/O，避免拖慢回調速度。"""
-    try:
-        sym=bidask.code
-        if sym not in _ofi_engines: _ofi_engines[sym]=RealTimeOFI()
-        _ofi_engines[sym].update_bidask(bidask)
-    except Exception as e:
-        logger.warning(f"OFI bidask callback處理失敗: {e}")
-
-def _on_tick_stk_v1(exchange, tick):
-    """Shioaji Tick callback：每收到一筆訂閱股票的逐筆成交就會被呼叫一次，事件驅動、隨時觸發。
-    注意：這個函式跑在Shioaji自己的內部執行緒，不是FastAPI/排程器那條主執行緒——
-    這裡只做簡單的累加(在CPython的GIL保護下，單一物件的屬性更新是安全的)，
-    不做任何重運算或I/O，避免拖慢回調速度或引入跨執行緒的競爭風險。"""
-    try:
-        sym=tick.code
-        if sym not in _ofi_engines: _ofi_engines[sym]=RealTimeOFI()
-        _ofi_engines[sym].update_tick(tick)
-    except Exception as e:
-        logger.warning(f"OFI tick callback處理失敗: {e}")
-
-def _flush_all_ofi():
-    """由_update_cache每30秒呼叫一次（橋接「事件驅動的tick/bidask」跟「定時驅動的決策」兩種節奏）：
-    把每檔已訂閱股票這個週期累積的OFI/大單流取出存進_ofi_latest，並讓引擎歸零開始下一輪累積。
-    對「所有已訂閱」的股票都做，不是只對這次有進入候選名單的股票做——這樣才能保證每檔股票
-    的累積週期都乾淨對齊30秒節奏，不會因為某次被no_trade_zone等規則篩掉就漏了一次flush，
-    導致下次讀到的其實是跨了好幾個30秒週期的累積值。"""
-    for sym in list(_ofi_subscribed):
-        engine=_ofi_engines.get(sym)
-        if engine is None: continue
-        ofi,big_trade=engine.flush()
-        _ofi_latest[sym]={"ofi":ofi,"big_trade":big_trade,"updated_at":time.time()}
-
-def subscribe_ofi_symbols(symbols) -> int:
-    """訂閱即時Tick+BidAsk資料流以啟用真實OFI計算(每檔股票需要2個訂閱)。
-    逐檔try/except，一檔失敗不影響其他檔，回傳成功訂閱數量——
-    如果這個數字遠小於預期，代表可能撞到訂閱數上限(46檔*2=92個訂閱不算少)，要去看log warning。"""
-    if not sinopac_api: return 0
-    ok_count=0
-    for sym in symbols:
-        if sym in _ofi_subscribed: continue
-        try:
-            contract=sinopac_api.Contracts.Stocks.get(sym)
-            if not contract: continue
-            sinopac_api.quote.subscribe(contract,quote_type=sj.constant.QuoteType.Tick,version=sj.constant.QuoteVersion.v1)
-            sinopac_api.quote.subscribe(contract,quote_type=sj.constant.QuoteType.BidAsk,version=sj.constant.QuoteVersion.v1)
-            _ofi_subscribed.add(sym)
-            ok_count+=1
-        except Exception as e:
-            logger.warning(f"OFI訂閱{sym}失敗(可能撞到訂閱數上限): {e}")
-    return ok_count
-
-def unsubscribe_all_ofi():
-    if not sinopac_api: return
-    for sym in list(_ofi_subscribed):
-        try:
-            contract=sinopac_api.Contracts.Stocks.get(sym)
-            if contract:
-                sinopac_api.quote.unsubscribe(contract,quote_type=sj.constant.QuoteType.Tick,version=sj.constant.QuoteVersion.v1)
-                sinopac_api.quote.unsubscribe(contract,quote_type=sj.constant.QuoteType.BidAsk,version=sj.constant.QuoteVersion.v1)
-        except Exception as e:
-            logger.warning(f"OFI取消訂閱{sym}失敗: {e}")
-    _ofi_subscribed.clear(); _ofi_engines.clear(); _ofi_latest.clear()
-
-def get_real_ofi(sym:str) -> Optional[Dict]:
-    """回傳上一個完整30秒週期的OFI/大單流快照。沒有訂閱這支股票回傳None；
-    已訂閱但這段時間沒有任何tick/bidask事件，會合理地拿到{"ofi":0.0,"big_trade":0.0}
-    (代表這30秒確實沒有方向性流動，0是有意義的真實值，不是「沒資料」，不需要額外的過時判定)。"""
-    if sym not in _ofi_subscribed: return None
-    return _ofi_latest.get(sym,{"ofi":0.0,"big_trade":0.0,"updated_at":time.time()})
-
-def is_no_trade_zone(prices:List[float], volumes:List[float]) -> Tuple[bool,str]:
-    """禁止交易區：國定假日(沿用既有行事曆)、連續假日前收盤前時段、月結算日(每月第三個星期三)、
-    成交量過低、波動度過低(代用指標，沒有逐筆資料算不出真正ATR)。
-    原規格還有「重大新聞前/法說會前」，需要公司行事曆或新聞源，目前沒有資料來源，沒有做這兩項。"""
-    now=tw_now()
-    if is_tw_market_holiday(now): return True,"國定假日"
-    tomorrow=now+timedelta(days=1)
-    if (tomorrow.weekday()>=5 or is_tw_market_holiday(tomorrow)) and now.hour*60+now.minute>=12*60+30:
-        return True,"連續假日前收盤前時段"
-    if now.weekday()==2 and 15<=now.day<=21:  # 每月第三個星期三＝台指期/選擇權結算日
-        return True,"月結算日"
-    if len(volumes)>=60:
-        recent20=sum(volumes[-20:])/20
-        baseline60=sum(volumes[-60:])/60
-        if baseline60>0 and recent20/baseline60<0.3:
-            return True,"成交量過低(相對近期明顯萎縮)"
-    elif len(volumes)>=20 and sum(volumes[-20:])==0:
-        return True,"成交量過低(完全無交易)"
-    if len(prices)>=20:
-        rets=[(prices[i]-prices[i-1])/prices[i-1] for i in range(1,len(prices)) if prices[i-1]]
-        recent=rets[-20:]
-        if recent:
-            mean_r=sum(recent)/len(recent)
-            vol=(sum((r-mean_r)**2 for r in recent)/len(recent))**0.5
-            if vol<0.0008: return True,"波動度過低(代用ATR指標)"
-    return False,""
-
-# 加權配分Phase2更新：Order Flow現在有近似資料可用(見approx_order_flow)，加回來給15%權重。
-# ML Probability 15%仍然沒有(沒有訓練管線/沒有足夠標記資料)，先把這15%依比例分配給其他6項真實資料項目。
-ADV_SCORE_WEIGHTS={"regime":23,"mtf":17,"vwap":12,"orb":12,"volume_quality":18,"order_flow":18}
-ADV_SCORE_GRADES=[(95,"S",1.0),(90,"A",0.75),(85,"B",0.5),(80,"C",0.25)]  # 由高到低檢查，沒達標都不交易
-
-def advanced_score(sym:str, prices:List[float], volumes:List[float], dir_:str) -> Dict:
-    """多因子加權綜合評分(0~100)+交易分級(S/A/B/C)。分級門檻(80/85/90/95)直接沿用規格書原始數字，
-    沒有經過正式校準，是起點不是定論——建議用模擬模式累積足夠交易後，回頭比對實際勝率/PF調整這些門檻。"""
-    entries=price_cache.get(sym,[])
-    regime=classify_market_regime(prices)
-    mtf=multi_timeframe_direction(entries)
-    vwap_val=sum(p*v for p,v in zip(prices[-20:],volumes[-20:]))/(sum(volumes[-20:]) or 1) if len(prices)>=20 else prices[-1]
-    vwap_ok = prices[-1]>=vwap_val if dir_=="L" else prices[-1]<=vwap_val
-    orb=orb_range(entries, tw_now().strftime("%Y-%m-%d"))
-    vq=volume_quality_score(volumes,entries)
-    of=approx_order_flow(entries)
-    absorb=detect_absorption(prices,entries)
-
-    regime_score = 100 if regime["regime"] in ("trending_bull","trending_bear") else (40 if regime["regime"]=="range" else 0)
-    mtf_ok = mtf["aligned_long"] if dir_=="L" else mtf["aligned_short"]
-    mtf_score = 100 if mtf_ok is True else (30 if mtf_ok is False else 55)  # None=資料不足，給中性分數，不當成過關也不當成沒過關
-    vwap_score = 100 if vwap_ok else 0
-    orb_breakout = orb is not None and ((dir_=="L" and prices[-1]>orb["high"]) or (dir_=="S" and prices[-1]<orb["low"]))
-    orb_score = 100 if orb_breakout else 40
-    vq_score = vq["score"]
-    # Order Flow分數：方向跟近似Delta一致給高分；偵測到「可能假突破」(創新高但買力衰退)直接重罰
-    of_aligned = (dir_=="L" and of["delta_recent"]>0) or (dir_=="S" and of["delta_recent"]<0)
-    order_flow_score = 15 if absorb["fake_breakout_risk"] else (90 if of_aligned else 45)
-
-    total=(regime_score*ADV_SCORE_WEIGHTS["regime"]+mtf_score*ADV_SCORE_WEIGHTS["mtf"]+
-           vwap_score*ADV_SCORE_WEIGHTS["vwap"]+orb_score*ADV_SCORE_WEIGHTS["orb"]+
-           vq_score*ADV_SCORE_WEIGHTS["volume_quality"]+order_flow_score*ADV_SCORE_WEIGHTS["order_flow"])/100
-
-    grade,size_mult="none",0.0
-    for th,g,m in ADV_SCORE_GRADES:
-        if total>=th: grade,size_mult=g,m; break
-
-    return {"total":round(total,1),"grade":grade,"size_mult":size_mult,"vwap_ok":vwap_ok,
-            "regime":regime["regime"],"regime_conf":regime.get("confidence",0),
-            "mtf":mtf,"orb_breakout":orb_breakout,"volume_quality":vq,
-            "order_flow":of,"fake_breakout_risk":absorb["fake_breakout_risk"]}
-
-def build_entry_reason(lgbm_conf:float, adv:Dict, dir_:str) -> str:
-    """把進場當下的LightGBM預測+輔助資訊組成一句人看得懂的話，存進trade_history，
-    讓使用者不用回頭翻log或猜，直接在前端看到「為什麼這筆會被買進」。"""
-    parts=[f"LightGBM模型預測做多勝率{lgbm_conf:.0f}%"]
-    if adv["vwap_ok"]: parts.append("VWAP上方" if dir_=="L" else "VWAP下方")
-    if adv["regime"] in ("trending_bull","trending_bear"):
-        parts.append(REGIME_LABEL_ZH.get(adv["regime"],adv["regime"]))
-    if adv["orb_breakout"]: parts.append("突破開盤區間高點" if dir_=="L" else "跌破開盤區間低點")
-    vq=adv.get("volume_quality",{})
-    if vq.get("score",0)>=70: parts.append(f"量能佳({vq['score']:.0f}分)")
-    parts.append(f"{lgbm_grade(lgbm_conf)}級")
-    return "、".join(parts)
-
-def build_exit_reason(tag:str, cfg:Dict, held_min:float, pp:float) -> str:
-    """出場tag(止盈/停損/持倉超時/反轉)本身已經是分類，這裡補上具體數字，讓使用者看得到「差多少觸發」"""
-    if tag=="止盈": return f"漲幅達{pp:.2f}%，觸及止盈線({cfg['tp']}%)"
-    if tag=="停損": return f"跌幅達{pp:.2f}%，觸及停損線({cfg['sl']}%，含移動停利調整後的價位)"
-    if tag=="持倉超時": return f"已持倉{held_min:.0f}分鐘(上限{cfg['max_hold_min']}分)，漲幅{pp:.2f}%已蓋過成本，獲利了結"
-    if tag=="反轉": return f"持倉{held_min:.0f}分鐘後技術指標轉向，訊號由多翻空提前出場"
-    if tag=="強制平倉": return "13:20當沖規定強制平倉，不留倉過夜"
-    return tag
-
-REGIME_LABEL_ZH={"trending_bull":"多頭趨勢","trending_bear":"空頭趨勢","range":"區間盤整","volatile":"高波動","panic":"恐慌"}
-
-# ══════════════════════════════════════════════════════════════════
-# LightGBM 進場模型：取代原本的「12項技術指標綜合評分」與「進階評分(C級)」做為進場判斷主力。
-# 風控（國定假日/處置股/當日3筆上限/VWAP之上）維持獨立硬性檢查，不受模型影響。
-#
-# 重要：extract_ml_features() 的特徵定義/順序，train_lgbm_model.py 訓練腳本必須完全一致，
-# 否則訓練出來的模型在這裡推論時，餵進去的數字意義會對不上，預測值會是垂圾——
-# 兩邊都用同一份 ML_FEATURE_NAMES 常數核對順序，新增/刪除特徵時兩邊要一起改。
-# ══════════════════════════════════════════════════════════════════
-ML_FEATURE_NAMES=[
-    "rsi","williams_r","cci","trend_str","vol_ratio",
-    "ma5_ma20_dev_pct","price_vwap_dev_pct",
-    "regime_code","mtf_aligned_code",
-    "volume_quality_score","bid_ask_imbalance","order_flow_delta_scaled","orb_breakout",
-    "real_ofi_interval","real_big_trade_interval_scaled",  # 模組一：上一個30秒週期累積的真實OFI/大單流，沒訂閱時給0(中性)
-]
-_REGIME_CODE={"trending_bull":2,"trending_bear":-2,"range":0,"volatile":1,"panic":-3,"unknown":0}
-
-def extract_ml_features(sym:str, prices:List[float], volumes:List[float], dir_:str="L") -> Optional[List[float]]:
-    """把已經算好的技術指標/Phase1-2引擎輸出，統一抽成固定順序的特徵向量餵給LightGBM模型。
-    回傳None代表資料不足，呼叫端應該跳過這個候選，不要硬塞進模型。"""
-    if len(prices)<30: return None
-    sig=calc_signal_py(prices,volumes)
-    if sig.get("rsi") is None: return None
-    regime=classify_market_regime(prices)
-    entries=price_cache.get(sym,[])
-    mtf=multi_timeframe_direction(entries)
-    vq=volume_quality_score(volumes,entries)
-    of=approx_order_flow(entries)
-    orb=orb_range(entries,tw_now().strftime("%Y-%m-%d"))
-    real_ofi=get_real_ofi(sym)  # 模組一：真實tick訂閱資料，沒有(還沒訂閱/還沒收到tick/太舊)就是None
-
-    ma20=sig.get("ma20") or 1
-    vwap=sig.get("vwap") or 1
-    aligned=mtf.get("aligned_long") if dir_=="L" else mtf.get("aligned_short")
-    mtf_code=1 if aligned is True else(-1 if aligned is False else 0)
-    orb_hit=1 if(orb is not None and prices[-1]>orb["high"] and dir_=="L") or \
-                 (orb is not None and prices[-1]<orb["low"] and dir_=="S") else 0
-
-    return [
-        sig.get("rsi",50), sig.get("williams_r",-50), sig.get("cci",0),
-        sig.get("trend_str",0), sig.get("vol_ratio",1),
-        (sig.get("ma5",ma20)/ma20-1)*100 if ma20 else 0,
-        (prices[-1]/vwap-1)*100 if vwap else 0,
-        _REGIME_CODE.get(regime["regime"],0), mtf_code,
-        vq.get("score",50), vq.get("bid_ask_imbalance",0),
-        of.get("delta_recent",0)/1000.0, orb_hit,
-        real_ofi["ofi"] if real_ofi else 0.0,
-        (real_ofi["big_trade"]/1000.0) if real_ofi else 0.0,
-    ]
-
-_lgbm_model={"booster":None,"loaded":False,"path":None,"error":None}
-LGBM_MODEL_PATH=os.environ.get("LGBM_MODEL_PATH","lgbm_model.txt")
-
-def _load_lgbm_model():
-    """惰性載入模型(第一次用到時才載入)，且把lightgbm的import包在function裡面而不是放在檔案最上面——
-    這樣即使尚未在requirements.txt加上lightgbm套件、或還沒訓練出模型檔案，整個後端服務照樣能正常啟動，
-    只是LightGBM進場判斷會自然停用(predict_lgbm_confidence回傳None)，不會讓整個API掛掉。"""
-    if _lgbm_model["loaded"]: return _lgbm_model["booster"]
-    _lgbm_model["loaded"]=True
-    if not os.path.exists(LGBM_MODEL_PATH):
-        _lgbm_model["error"]=f"模型檔案不存在: {LGBM_MODEL_PATH}（請先用 train_lgbm_model.py 訓練並放到這個路徑）"
-        logger.warning(f"⚠️ LightGBM{_lgbm_model['error']}")
-        return None
-    try:
-        import lightgbm as lgb
-        _lgbm_model["booster"]=lgb.Booster(model_file=LGBM_MODEL_PATH)
-        _lgbm_model["path"]=LGBM_MODEL_PATH
-        logger.info(f"✅ LightGBM模型已載入：{LGBM_MODEL_PATH}")
-    except ImportError:
-        _lgbm_model["error"]="lightgbm套件未安裝（requirements.txt需加上lightgbm並重新部署）"
-        logger.warning(f"⚠️ {_lgbm_model['error']}")
-    except Exception as e:
-        _lgbm_model["error"]=f"模型載入失敗: {e}"
-        logger.warning(f"⚠️ LightGBM{_lgbm_model['error']}")
-    return _lgbm_model["booster"]
-
-def predict_lgbm_confidence(sym:str, prices:List[float], volumes:List[float], dir_:str="L") -> Tuple[Optional[float],Optional[List[float]]]:
-    """回傳(LightGBM預測的「做多勝率信心度」(0~100), 餵進模型的特徵向量)。模型不存在/特徵不足/預測失敗
-    都回傳(None,None)，呼叫端看到None就該跳過該候選——不會也不該悄悄退回舊的規則式評分，那樣等於沒有真的換掉。
-    修正：原本只回傳信心度，特徵向量算完就丟，事後沒有任何資料可以回頭做SHAP特徵歸因分析——
-    5天驗證期跑完想分析「到底哪個特徵真的有用、哪個是雜訊」時，會發現根本沒有歷史特徵資料可以分析。"""
-    booster=_load_lgbm_model()
-    if booster is None: return None,None
-    feats=extract_ml_features(sym,prices,volumes,dir_)
-    if feats is None: return None,None
-    try:
-        prob=booster.predict([feats])[0]
-        return float(max(0.0,min(100.0,prob*100))),feats
-    except Exception as e:
-        logger.warning(f"LightGBM預測失敗 {sym}: {e}")
-        return None,None
-
-def lgbm_grade(conf:float) -> str:
-    """純粹顯示用的等級標籤(沿用S/A/B/C視覺風格)，不再決定部位大小——
-    部位大小現在由下面的連續線性公式決定，這裡只是給前端一個好懂的徽章。"""
-    if conf>=90: return "S"
-    if conf>=83: return "A"
-    if conf>=77: return "B"
-    return "C"
-
-def calculate_dynamic_position_ratio(win_prob_pct:float, min_conf_pct:float, max_alloc_pct:float) -> float:
-    """LightGBM機率動態部位縮放——連續線性比例，取代原本S/A/B/C離散分級跳階。
-    勝率剛好等於門檻時給最大曝險額度的30%當基本底倉，勝率趨近100%時線性放大到最大曝險上限，
-    公式：(勝率-門檻)/(100-門檻)，限制在0~1之間，再用 0.3+0.7*scaling_factor 算出實際比例。
-
-    注意：max_alloc_pct沿用你既有RISK_CFG的alloc(低5%/中10%/高20%)，不是規格書建議的30%/20%/10%——
-    那組數字跟現有的「總曝險30%上限」疊在一起，會讓低風險單筆信心夠高時就用滿30%總曝險額度，
-    等於低風險變成最集中而不是最分散，跟風險等級的一般直覺相反。如果你還是想要規格書那組數字，
-    跟我說一聲，我可以照那組數字改，這裡先用跟現有風控設計一致的數字。"""
-    if win_prob_pct < min_conf_pct: return 0.0
-    scaling_factor = (win_prob_pct - min_conf_pct) / (100.0 - min_conf_pct)
-    scaling_factor = max(0.0, min(1.0, scaling_factor))
-    return max_alloc_pct/100 * (0.3 + 0.7*scaling_factor)
 
 # ══════════════════════════════════════════════════════════════════
 # 全域狀態
@@ -774,12 +62,26 @@ _auto_state_defaults = {
     "enabled":False,"risk":"low","cap_pct":100,"paper_mode":True,  # 預設模擬下單，須使用者明確選擇才會送真實委託
     "watchlist":[],"positions":[],"log":[],"trade_history":[],  # trade_history: 每筆已完成交易的明細記錄
     "capital":1_000_000,
+    # 模擬資金：完全獨立於真實帳戶餘額的虛擬現金帳本，不會被真實帳戶的待交割款卡住——
+    # 不然模擬模式的部位大小被真實帳戶的T+2交割綁住，完全不合理(模擬本來就不該花真錢，
+    # 也就不該被真錢的交割時間表限制)。預設1000萬，可以透過/auto/paper-capital調整。
+    # 跟「真實capital」一樣的可用/已交割概念：paper_capital是總帳，paper_pending_settlements
+    # 記錄每筆平倉後還在交割中(T+2)的金額，可用金額=paper_capital減去還沒交割完成的部分。
+    "paper_capital":10_000_000.0,
+    "paper_pending_settlements":[],  # [{"amount":float,"settle_date":"YYYY-MM-DD"}, ...]
     "daily_pnl":0.0,"daily_win":0,"daily_trades":0,
     "consec_loss":0,"pause_until":0,"trade_date":None,
-    "_loss_stop_logged":False,"_profit_lock_logged":False,"_afford_warn_logged":False,
+    "_loss_stop_logged":False,"_profit_lock_logged":False,"_afford_warn_logged":False,"_zero_capital_logged":False,
     # 模擬驗證進度：累積筆數/交易日不會被每日重置清空（跟trade_history不一樣），
     # 做為「切換成真實下單」前的最低驗證門檻依據，見 PAPER_VALIDATION_MIN_*。
     "paper_validation":{"trade_count":0,"trading_days":[]},
+    # 每日交易漏斗：記錄每個候選股票在每一關被擋下的原因次數，每天重置(_reset_daily)。
+    # 直接回答「今天為什麼沒有交易」，不用再去猜log文字背後的原因。
+    "funnel":{"scanned":0,"bad_time":0,"no_trade_zone":0,"not_eligible":0,"limit_down_risk":0,
+              "vwap_reject":0,"wide_spread":0,"no_model":0,"low_confidence":0,"sector_dup":0,"unaffordable":0,
+              "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0},
+    "ofi_failed_symbols":[],  # OFI訂閱失敗的股票代號清單，點log時顯示具體是哪幾檔
+    "capital_info":None,  # 最近一次資金同步的完整明細(balance/available/pending_settlement/available_after_settlement)
 }
 auto_state = db_load("auto_state", None) or dict(_auto_state_defaults)
 # 資料庫存的舊資料可能缺少新版新增的欄位，補齊避免KeyError
@@ -801,11 +103,8 @@ RISK_CFG = {
 # 至少要先讓「模擬模式」（用真實股價算損益，不花真錢）實際跑過一段時間、看過足夠多筆完整交易結果，
 # 確認新邏輯/新標的真的可行，而不是憑感覺直接賭一次真實委託。
 # 門檻可依需求調整；若使用者很清楚自己在做什麼，可在/auto/start帶force_real=true跳過此檢查。
+# (PAPER_VALIDATION_MIN_TRADES/MIN_DAYS/MAX_TRADES_PER_DAY/CONSEC_LOSS_STOP 已從config.py匯入)
 # ══════════════════════════════════════════════════════════════════
-PAPER_VALIDATION_MIN_TRADES=20
-PAPER_VALIDATION_MIN_DAYS=5
-MAX_TRADES_PER_DAY=3        # 規格書新增風控：當日最多交易3次，避免訊號反覆觸發造成過度交易、手續費侵蝕獲利
-CONSEC_LOSS_STOP=2          # 規格書收緊：原本連虧3次冷靜15分鐘，改成連虧2次直接停止當日交易(更保守)
 
 def _record_paper_validation(pnl:float=0.0, pct:float=0.0):
     """每筆模擬交易平倉後呼叫：累積驗證進度，trade_count/trading_days/累積損益都不會被_reset_daily清空。
@@ -840,7 +139,9 @@ def _record_feature_log(sym:str, pos:Dict, pnl:float, pct:float, tag:str):
     log.append(entry)
     auto_state["feature_log"]=log[-500:]
 
-
+def _paper_validation_progress() -> dict:
+    """真實下單前的驗證進度查詢：累積勝率/獲利因子/平均贏輸%，供/auto/validation跟/auto/start
+    的真實模式門檻檢查共用。"""
     pv=auto_state.get("paper_validation",{"trade_count":0,"trading_days":[]})
     trades=pv.get("trade_count",0); days=len(pv.get("trading_days",[]))
     ok = trades>=PAPER_VALIDATION_MIN_TRADES and days>=PAPER_VALIDATION_MIN_DAYS
@@ -857,7 +158,6 @@ def _record_feature_log(sym:str, pos:Dict, pnl:float, pct:float, tag:str):
             "avg_win_pct":avg_win_pct,"avg_loss_pct":avg_loss_pct,
             "total_pnl":round(total_win+total_loss,0)}
 
-price_cache: Dict[str,List[Dict]] = {}
 # ══════════════════════════════════════════════════════════════════
 # 看門狗：Shioaji官方自己的參考交易終端機文件寫得很清楚——
 # 「停損/停利為客戶端觸價單，只在頁面開啟時監控」，沒有真正的券商/交易所端OCO或觸價單給股票用。
@@ -889,37 +189,7 @@ def watchdog_check():
 _last_cum_volume: Dict[str,int] = {}  # 修正：追蹤每檔股票上次輪詢時的累計成交量，用來換算成「這次輪詢期間」的增量
 MAX_BARS = 120
 ml_predictions: Dict[str,float] = {}  # {symbol: 0~1 預測勝率} 由前端訓練完成後同步
-
-# ══════════════════════════════════════════════════════════════════
-# 全市場掃描股票池（0050成分股 + 主要流動性最好的台股，非使用者自選股）
-# 用於「飆股雷達」全市場掃描，跟使用者的自選股/真實交易清單(auto_state["watchlist"])完全分開
-# ══════════════════════════════════════════════════════════════════
-SCAN_UNIVERSE = [
-    "2330","2454","2308","2317","3711","2327","2303","2383","2891","3037",  # 0050前10大成分股
-    "2882","2886","2884","2881","2880","2885","2890","5880","2892","2887",  # 金融股
-    "2382","3008","2357","2379","4938","2345","2412","1301","1303","2002", # 科技/傳產龍頭
-    "3034","3045","2353","2356","6669","3661","3653","2474","2207","1216", # 其他大型股
-    # ── 可負擔低價股池（2026/06盤面實際股價約NT$12~25，1張曝險約1.2萬~2.5萬，
-    #    對應目前資金規模在「高風險」設定下單筆預算約NT$2萬內可負擔；上面的大型/高價股
-    #    在修正②上線後不會再強迫買，只是現在資金規模還買不起，等資金/cap_pct提高會自動恢復可用）──
-    "2849","2836","2834","2812","2801","2838",  # 中小型銀行：價格親民(約NT$12~23)、流動性夠、可當沖
-    # 註：5880合庫金、2887台新新光金已在上面的金融股清單中，價格約NT$24~33，資金/cap_pct提高後也買得起
-]
-
-# 股票所屬板塊（用於進場時的板塊分散檢查，避免同一板塊集中持倉風險過高）
-SECTOR_MAP = {
-    "2330":"半導體","2303":"半導體",
-    "2454":"IC設計","2379":"IC設計","3034":"IC設計","3661":"IC設計",
-    "2308":"電源工業電子","3711":"封測","2327":"被動元件","2383":"PCB連接器","3037":"PCB",
-    "2317":"電子代工","2382":"電子代工","4938":"電子代工","2356":"電子代工","6669":"伺服器",
-    "2891":"金融","2882":"金融","2886":"金融","2884":"金融","2881":"金融",
-    "2880":"金融","2885":"金融","2890":"金融","5880":"金融","2892":"金融","2887":"金融",
-    "3008":"光學","2345":"網通設備","2412":"電信","3045":"電信",
-    "1301":"塑化","1303":"塑化","2002":"鋼鐵","2353":"筆電",
-    "3653":"散熱","2474":"機殼","2207":"汽車","1216":"食品",
-    # 可負擔低價股池（皆歸金融板塊，會跟既有金控/銀行股互相排擠，避免重倉同一族群）
-    "2849":"金融","2836":"金融","2834":"金融","2812":"金融","2801":"金融","2838":"金融",
-}
+# (SCAN_UNIVERSE/SECTOR_MAP 已從config.py匯入)
 
 # ── 個股合約資訊快取（當沖資格 day_trade、漲跌停價，每日更新一次，避免重複查詢）──
 contract_info_cache: Dict[str,Dict] = {}  # {symbol: {day_trade, limit_up, limit_down, cached_date}}
@@ -1032,6 +302,10 @@ def _update_cache():
     symbols = set(auto_state["watchlist"])
     if auto_state.get("paper_mode"):
         symbols |= set(SCAN_UNIVERSE)
+    # 大盤同步性特徵需要的市場指標(0050)：不管使用者自選清單或paper_mode設定如何，一律持續追蹤價格，
+    # 跟OFI訂閱一樣是核心基礎設施，不該因為使用者改了自選股清單就斷掉——這支不會被當成交易標的
+    # (是否可交易仍然只看candidates_pool，跟這裡的價格追蹤是分開的兩件事)。
+    symbols.add(MARKET_INDEX_SYMBOL)
     for sym in symbols:
         snap=_snapshot(sym)
         if snap:
@@ -1059,7 +333,11 @@ def _reset_daily():
     if auto_state["trade_date"]!=today:
         auto_state.update({"trade_date":today,"daily_pnl":0.0,
             "daily_win":0,"daily_trades":0,"consec_loss":0,"pause_until":0,
-            "_loss_stop_logged":False,"_profit_lock_logged":False,"_afford_warn_logged":False,"trade_history":[]})
+            "_loss_stop_logged":False,"_profit_lock_logged":False,"_afford_warn_logged":False,"_zero_capital_logged":False,"trade_history":[],
+            "funnel":{"scanned":0,"bad_time":0,"no_trade_zone":0,"not_eligible":0,"limit_down_risk":0,
+                      "vwap_reject":0,"wide_spread":0,"no_model":0,"low_confidence":0,"sector_dup":0,"unaffordable":0,
+                      "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0}})
+        _prune_settled_paper_pending()
         _log("每日計數器重置 ✓")
 
 def _place_real_order(sym:str, action, qty:int):
@@ -1084,6 +362,13 @@ def auto_trade_tick():
     _reset_daily()
     _update_cache()
     if auto_state["pause_until"]>time.time(): return
+    if auto_state["capital"]<=0:
+        # 修正：可用資金被待交割款吃光時capital會是0(這是真實狀況，不是bug，見main.py的_refresh_capital_from_account)，
+        # 這裡要明確擋下來當成「今天沒錢可動用，暫停」處理——不只是防呆，0元帳戶本來就不該繼續嘗試任何新倉位計算，
+        # 而且下面daily_pnl/capital這個除法，capital=0會直接讓整個tick crash，每30秒crash一次，必須在這裡先擋掉。
+        if not auto_state.get("_zero_capital_logged"):
+            _log("[暫停]目前可用資金為0(待交割款佔用)，暫停今日交易直到資金恢復"); auto_state["_zero_capital_logged"]=True
+        return
     if abs(min(0,auto_state["daily_pnl"]))/auto_state["capital"]*100>=3:
         if not auto_state.get("_loss_stop_logged"):
             _log("[停止]今日虧損達3%，停止交易"); auto_state["_loss_stop_logged"]=True
@@ -1096,6 +381,7 @@ def auto_trade_tick():
     # 出場檢查
     to_close=[]
     for pos in auto_state["positions"]:
+      try:
         sym=pos["sym"]; snap=_snapshot(sym)
         if not snap: continue
         p=snap["price"]
@@ -1138,6 +424,9 @@ def auto_trade_tick():
             cost=calc_round_trip_cost(entry_p,exit_p,shares)
             gross=(p-pos["entry"])*shares*(1 if pos["dir"]=="L" else -1)
             net_pnl=gross-cost["total_cost"]
+            settlement_date=None
+            if auto_state.get("paper_mode") and pos["dir"]=="L":
+                settlement_date=_record_paper_close(p,shares,tw_now().strftime("%Y-%m-%d"))
             auto_state["daily_pnl"]+=net_pnl; auto_state["daily_trades"]+=1
             if net_pnl>0: auto_state["daily_win"]+=1; auto_state["consec_loss"]=0
             else:
@@ -1158,6 +447,7 @@ def auto_trade_tick():
                 "gross_pnl":round(gross,0),"fees":round(cost["total_cost"],0),
                 "pnl":round(net_pnl,0),"pct":round(pp,2),"tag":tag,
                 "open_time":pos.get("open_time",""),"close_time":tw_now().strftime("%H:%M:%S"),
+                "settlement_date":settlement_date,
                 "from_pool": sym not in auto_state["watchlist"],
                 "grade":pos.get("grade","-"),"regime":pos.get("regime","-"),
                 "entry_reason":pos.get("entry_reason","-"),"exit_reason":exit_reason,
@@ -1176,6 +466,11 @@ def auto_trade_tick():
             close_act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
             _place_real_order(sym,close_act,pos["qty"])
             to_close.append(sym)
+      except Exception as e:
+        # 防禦性隔離：跟下面候選評估迴圈一樣的道理，但這裡更關鍵——一檔持倉檢查時crash，
+        # 不能連帶讓其他持倉的停損停利都沒被檢查到，那樣等於本來該出場的單子可能一直卡著不出場。
+        logger.warning(f"檢查持倉{pos.get('sym','?')}出場條件時發生例外，跳過這筆繼續檢查其他持倉: {e}")
+        continue
     auto_state["positions"]=[p for p in auto_state["positions"] if p["sym"] not in to_close]
     # 開倉（僅在09:30-13:00主動交易時段，避開開盤亂流與尾盤風險）
     if not can_open_new_position():
@@ -1188,37 +483,61 @@ def auto_trade_tick():
 
     # 先逐一檢查資格、算出每檔的「AI預估利潤分數」，蒐集成候選清單
     candidates=[]
+    fn=auto_state["funnel"]
+    # 效能：大盤同步性跟個股無關，這個tick只要算一次，不要讓底下每檔股票各自重算一次一樣的結果
+    market_ctx=get_market_context()
+    # 模擬模式用獨立的模擬資金算部位大小，不要被真實帳戶的T+2交割卡住；真實模式才用真實capital。
+    effective_capital=get_paper_available_capital() if auto_state.get("paper_mode") else auto_state["capital"]
     for sym in candidates_pool:
-        if sym in existing: continue
-        hist=price_cache.get(sym,[])
-        if len(hist)<30: continue
-        prices_h=[h["price"] for h in hist]; vols_h=[h["volume"] for h in hist]
-        # 修正⑩：進場判斷主力換成LightGBM模型——sig還是要算，但只用bad_time(開盤前30分/收盤前)
-        # 這個時間風控欄位，不再用sig['conf']/sig['action']決定要不要進場(那是被取代的"12項指標綜合評分")
-        sig=calc_signal_py(prices_h,vols_h)
-        if sig.get("bad_time"): continue
-        dir_="L"  # 規格要求：只看LightGBM「做多勝率」，當沖只做多單
-        # 禁止交易區：國定假日/連續假日前收盤前/月結算日/量過低/波動度過低，這些情況下不進場(維持獨立硬性檢查)
-        ntz,ntz_reason=is_no_trade_zone(prices_h,vols_h)
-        if ntz: continue
-        # 真實當沖資格檢查（用永豐合約真實資料：day_trade=No的處置股票/不符資格股票直接跳過，維持獨立硬性檢查）
-        ok,reason = can_day_trade(sym, is_sell_first=False)
-        if not ok: continue
-        cinfo=get_contract_info(sym)
-        p_now=hist[-1]["price"]
-        if cinfo["limit_down"]>0 and p_now<=cinfo["limit_down"]*1.005: continue  # 接近跌停，做多賣不掉風險高
-        # 還是要算advanced_score：①VWAP硬否決規格明確要求保留 ②regime/orb/volume_quality等輸出
-        # 現在角色變成「餵給LightGBM的特徵」+「事後顯示用的輔助資訊」，不再是獨立的進場門檻
-        adv=advanced_score(sym,prices_h,vols_h,dir_)
-        if not adv["vwap_ok"]: continue  # 規格明確要求保留的VWAP硬否決
-        # LightGBM做多勝率信心度——取代原本的12項指標評分跟進階評分(C級)門檻
-        lgbm_conf,lgbm_feats=predict_lgbm_confidence(sym,prices_h,vols_h,dir_)
-        if lgbm_conf is None:
-            continue  # 模型還沒訓練/載入失敗：誠實地不交易，不要悄悄退回舊邏輯製造「好像在運作」的假象
-        if lgbm_conf<cfg["min_conf"]: continue  # 沿用既有風險等級門檻(低72%/中68%/高65%)，只是現在門檻比的是模型機率
-        est_profit_score=lgbm_conf*cfg["tp"]
-        candidates.append({"sym":sym,"sig":sig,"dir":dir_,"price":p_now,"est_profit_score":est_profit_score,
-                            "adv":adv,"lgbm_conf":lgbm_conf,"lgbm_feats":lgbm_feats})
+        try:
+            if sym in existing: continue
+            hist=price_cache.get(sym,[])
+            if len(hist)<30: continue
+            fn["scanned"]+=1
+            prices_h=[h["price"] for h in hist]; vols_h=[h["volume"] for h in hist]
+            # 修正⑩：進場判斷主力換成LightGBM模型——sig還是要算，但只用bad_time(開盤前30分/收盤前)
+            # 這個時間風控欄位，不再用sig['conf']/sig['action']決定要不要進場(那是被取代的"12項指標綜合評分")
+            sig=calc_signal_py(prices_h,vols_h)
+            if sig.get("bad_time"): fn["bad_time"]+=1; continue
+            dir_="L"  # 規格要求：只看LightGBM「做多勝率」，當沖只做多單
+            # 禁止交易區：國定假日/連續假日前收盤前/月結算日/量過低/波動度過低，這些情況下不進場(維持獨立硬性檢查)
+            ntz,ntz_reason=is_no_trade_zone(prices_h,vols_h)
+            if ntz: fn["no_trade_zone"]+=1; continue
+            # 真實當沖資格檢查（用永豐合約真實資料：day_trade=No的處置股票/不符資格股票直接跳過，維持獨立硬性檢查）
+            ok,reason = can_day_trade(sym, is_sell_first=False)
+            if not ok: fn["not_eligible"]+=1; continue
+            cinfo=get_contract_info(sym)
+            p_now=hist[-1]["price"]
+            if cinfo["limit_down"]>0 and p_now<=cinfo["limit_down"]*1.005: fn["limit_down_risk"]+=1; continue  # 接近跌停，做多賣不掉風險高
+            # 還是要算advanced_score：①VWAP硬否決規格明確要求保留 ②regime/orb/volume_quality等輸出
+            # 現在角色變成「餵給LightGBM的特徵」+「事後顯示用的輔助資訊」，不再是獨立的進場門檻
+            adv=advanced_score(sym,prices_h,vols_h,dir_)
+            if not adv["vwap_ok"]: fn["vwap_reject"]+=1; continue  # 規格明確要求保留的VWAP硬否決
+            # 買賣價差過濾：價差太寬，光是進場那一下就先吃掉一截停損空間，當沖薄利策略對這個特別敏感。
+            # 修正：原本固定0.3%門檻，驗證時發現NT$12~16的便宜銀行股(2849/2836/2834，剛好是這個系統
+            # 特地加入解決資金不足問題的那幾檔)，連最小可能的1個tick價差都已經超過0.3%，等於不管
+            # 流動性多好，這幾檔永遠被擋下來。改成依股價換算tick大小再設門檻(max_allowed_spread_pct)，
+            # 不同價位的股票才能公平比較。還沒訂閱到bidask資料時回傳None，這時候選擇不卡(寧可讓
+            # LightGBM評分繼續判斷)，避免訂閱還沒就位時就把全部候選都擋掉。
+            spread_pct=get_latest_spread_pct(sym)
+            if spread_pct is not None and spread_pct>max_allowed_spread_pct(p_now):
+                fn["wide_spread"]=fn.get("wide_spread",0)+1; continue
+            # LightGBM做多勝率信心度——取代原本的12項指標評分跟進階評分(C級)門檻
+            lgbm_conf,lgbm_feats=predict_lgbm_confidence(sym,prices_h,vols_h,dir_,market_ctx,spread_pct)
+            if lgbm_conf is None:
+                fn["no_model"]+=1
+                continue  # 模型還沒訓練/載入失敗：誠實地不交易，不要悄悄退回舊邏輯製造「好像在運作」的假象
+            if lgbm_conf<cfg["min_conf"]: fn["low_confidence"]+=1; continue  # 沿用既有風險等級門檻(低72%/中68%/高65%)，只是現在門檻比的是模型機率
+            est_profit_score=lgbm_conf*cfg["tp"]
+            candidates.append({"sym":sym,"sig":sig,"dir":dir_,"price":p_now,"est_profit_score":est_profit_score,
+                                "adv":adv,"lgbm_conf":lgbm_conf,"lgbm_feats":lgbm_feats})
+        except Exception as e:
+            # 防禦性隔離：單一股票的資料異常(任何原因，不只是已知的零成交量這種)絕對不能讓整個tick
+            # 連帶評估失敗——少了這層保護，一檔有問題的股票會讓當次30秒週期裡其他45檔全部陪著一起跳過，
+            # 而且看門狗的心跳是在函式最前面就先記過了，不會因為這裡crash而被偵測到「卡住」，
+            # 等於這種錯誤可能默默重複發生好幾天都不會被任何警示機制抓到。
+            logger.warning(f"候選評估{sym}時發生例外，跳過這檔繼續處理其他股票: {e}")
+            continue
 
     # 依LightGBM信心度排序(信心最高=模型最有把握)，同分才看AI預估利潤分數
     candidates.sort(key=lambda c:(c["lgbm_conf"],c["est_profit_score"]),reverse=True)
@@ -1235,12 +554,12 @@ def auto_trade_tick():
     MAX_NEW_ENTRIES_PER_TICK=2
     for c in candidates:
         if len(auto_state["positions"])>=cfg["max_pos"]: break
-        if auto_state["daily_trades"]>=MAX_TRADES_PER_DAY: break  # 風控新增：當日交易次數上限，避免訊號反覆觸發過度交易
-        if opened_this_tick>=MAX_NEW_ENTRIES_PER_TICK: break
+        if auto_state["daily_trades"]>=MAX_TRADES_PER_DAY: fn["daily_cap_reached"]+=1; break  # 風控新增：當日交易次數上限，避免訊號反覆觸發過度交易
+        if opened_this_tick>=MAX_NEW_ENTRIES_PER_TICK: fn["per_tick_cap_reached"]+=1; break
         sym,sig,dir_,p,adv,lgbm_conf,lgbm_feats=c["sym"],c["sig"],c["dir"],c["price"],c["adv"],c["lgbm_conf"],c["lgbm_feats"]
         # 板塊分散：同板塊已有持倉就跳過這個候選，避免集中壓在同一個產業（如同時押好幾家金融股）
         this_sector=SECTOR_MAP.get(sym)
-        if this_sector and this_sector in held_sectors: continue
+        if this_sector and this_sector in held_sectors: fn["sector_dup"]+=1; continue
         # 修正②：原本用 max(1, …) 強制至少買1張，對高價股（如台積電2500+、健策3800+）來說，
         # 1張的曝險動輒幾百萬，遠超過風險設定要動用的資金（例：低風險alloc=5%，100K資金只想動用5,000元，
         # 卻被迫買下252萬元台積電，曝險是帳戶資金的25倍），導致小幅價格波動就被放大成鉅額虧損。
@@ -1248,14 +567,16 @@ def auto_trade_tick():
         # 修正⑩：部位大小依LightGBM信心度分級加碼(S/A/B/C=100%/75%/50%/25%)，取代原本的進階評分分級。
         # 模組二：LightGBM機率動態部位縮放（連續線性比例），取代原本的離散分級加碼
         alloc_ratio=calculate_dynamic_position_ratio(lgbm_conf,cfg["min_conf"],cfg["alloc"]*100)
-        budget=auto_state["capital"]*(auto_state["cap_pct"]/100)*alloc_ratio
-        max_aggregate=auto_state["capital"]*MAX_AGGREGATE_EXPOSURE_PCT/100
+        budget=effective_capital*(auto_state["cap_pct"]/100)*alloc_ratio
+        max_aggregate=effective_capital*MAX_AGGREGATE_EXPOSURE_PCT/100
         budget=min(budget,max(0,max_aggregate-total_exposure))  # 受總曝險上限約束
         qty=int(budget/(p*1000))
         if qty<1:
+            fn["unaffordable"]+=1
             skipped_unaffordable.append((sym,p))
             continue
         grade=lgbm_grade(lgbm_conf)
+        if auto_state.get("paper_mode"): _record_paper_open(p,qty*1000)
         auto_state["positions"].append({
             "sym":sym,"dir":dir_,"qty":qty,"entry":p,
             "sl":round(p*(1-cfg["sl"]/100) if dir_=="L" else p*(1+cfg["sl"]/100),2),
@@ -1272,13 +593,14 @@ def auto_trade_tick():
              f"({grade}級) 市場環境:{adv['regime']}",sym)
         existing.add(sym)
         opened_this_tick+=1
+        fn["opened"]+=1
         total_exposure+=p*qty*1000
         if this_sector: held_sectors.add(this_sector)
     # 透明度提示：修正②上線後，資金規模配不上整張交易（台股當沖只能整張，零股不開放當沖）時，
     # AI可能會整天都找不到「買得起」的標的而完全不下單——這不是bug，是修正後誠實反映風險，
     # 但每天只提示一次，讓使用者知道發生了什麼、該調整資金配置或股票池，而不是誤以為系統當機。
     if opened_this_tick==0 and skipped_unaffordable and not auto_state.get("_afford_warn_logged"):
-        budget=auto_state["capital"]*(auto_state["cap_pct"]/100)*cfg["alloc"]
+        budget=effective_capital*(auto_state["cap_pct"]/100)*cfg["alloc"]
         cheapest=min(skipped_unaffordable,key=lambda x:x[1])
         _log(f"[提示]本輪{len(skipped_unaffordable)}檔候選股價超出目前資金配置上限（{auto_state['risk']}風險單筆預算NT${budget:.0f}，"
              f"最低價候選{cheapest[0]}@{cheapest[1]:.1f}仍需NT${cheapest[1]*1000:.0f}/張），暫無買得起的標的。"
@@ -1305,6 +627,9 @@ def force_close_all():
                 shares
             )["total_cost"]
             net_pnl=gross-cost
+            settlement_date=None
+            if auto_state.get("paper_mode") and pos["dir"]=="L":
+                settlement_date=_record_paper_close(p,shares,tw_now().strftime("%Y-%m-%d"))
             auto_state["daily_pnl"]+=net_pnl; auto_state["daily_trades"]+=1
             if net_pnl>0: auto_state["daily_win"]+=1; auto_state["consec_loss"]=0
             else: auto_state["consec_loss"]+=1
@@ -1317,6 +642,7 @@ def force_close_all():
                 "gross_pnl":round(gross,0),"fees":round(cost,0),
                 "pnl":round(net_pnl,0),"pct":round(pp_fc,2),"tag":"強制平倉",
                 "open_time":pos.get("open_time",""),"close_time":tw_now().strftime("%H:%M:%S"),
+                "settlement_date":settlement_date,
                 "from_pool": sym not in auto_state["watchlist"],
                 "grade":pos.get("grade","-"),"regime":pos.get("regime","-"),
                 "entry_reason":pos.get("entry_reason","-"),"exit_reason":"13:20當沖規定強制平倉，不留倉過夜",
@@ -1396,6 +722,38 @@ def _periodic_persist():
     放在獨立排程更不容易漏掉某個情況沒存到）"""
     _persist_auto_state()
 
+def get_paper_available_capital() -> float:
+    """模擬資金的「可用」金額=總帳(paper_capital)減去還在T+2交割中、還不能拿來開新倉的部分。
+    跟真實帳戶的available_after_settlement是同一個概念，只是這裡的錢全部都是假的，
+    只用來讓模擬模式的部位大小計算更貼近真實情況(剛平倉的錢不會馬上又能用)。"""
+    today=tw_now().strftime("%Y-%m-%d")
+    pending=sum(p["amount"] for p in auto_state["paper_pending_settlements"] if p["settle_date"]>today)
+    return max(0.0,auto_state["paper_capital"]-pending)
+
+def _prune_settled_paper_pending():
+    """把已經過了交割日的紀錄從pending清單移除，避免清單無限長下去——
+    這些錢已經算進paper_capital裡了(平倉時就立刻+=過)，這裡只是清掉「不再需要鎖住」的舊紀錄。"""
+    today=tw_now().strftime("%Y-%m-%d")
+    auto_state["paper_pending_settlements"]=[p for p in auto_state["paper_pending_settlements"] if p["settle_date"]>today]
+
+def _record_paper_open(entry_price:float, shares:int):
+    """模擬模式開倉：立刻從paper_capital扣掉成本+買進手續費(買進不像賣出有交割延遲，
+    下單當下就需要這筆可動用資金，跟真實當沖券商的概念一致)。"""
+    buy_fee=max(20,entry_price*shares*FEE_RATE*FEE_DISCOUNT)
+    auto_state["paper_capital"]-=(entry_price*shares+buy_fee)
+
+def _record_paper_close(exit_price:float, shares:int, close_date_str:str):
+    """模擬模式平倉：賣出所得(扣掉賣出手續費+證交稅)立刻計入paper_capital的總帳(讓「總資產」
+    隨時反映真實損益)，但同時登記一筆T+2交割中紀錄，這筆金額在交割完成前不算進「可用資金」，
+    跟真實當沖規則一致——模擬資金要像真實交易一樣跑，不能讓使用者以為平倉的錢馬上能再拿來開倉。"""
+    sell_fee=max(20,exit_price*shares*FEE_RATE*FEE_DISCOUNT)
+    tax=exit_price*shares*DAYTRADE_TAX_RATE
+    net_proceeds=exit_price*shares-sell_fee-tax
+    auto_state["paper_capital"]+=net_proceeds
+    settle_date=next_settlement_date(tw_now())
+    auto_state["paper_pending_settlements"].append({"amount":net_proceeds,"settle_date":settle_date})
+    return settle_date
+
 def _refresh_capital_from_account():
     """內部函式：從永豐真實帳戶刷新可用資金（扣除T+2交割款），供API端點與排程器共用，
     確保即使前端沒開著，後端排程也會定期自己刷新，不會用過時的資金數字下單。
@@ -1416,11 +774,16 @@ def _refresh_capital_from_account():
         except Exception as se:
             logger.warning(f"無法取得交割資料，風控將以可用餘額為準（未扣交割款）: {se}")
         available_after_settlement = max(0.0, avail - pending_settlement)
-        if available_after_settlement>0:
-            auto_state["capital"]=available_after_settlement
-        return {"account":str(stock_account),"balance":balance,"available":avail,
+        # 修正：原本只在>0時才更新capital，導致「真的可用資金剛好是0」這個最需要被正確反映的情況，
+        # 反而被當成「不可信」而忽略，capital留在舊的(可能是預設100萬)數字上——
+        # 等於系統不知道自己沒錢，還拿著虛高的資金去算部位大小。這裡是成功抓到真實餘額後算出來的結果，
+        # 0本身就是有效、真實的答案(代表現在真的不能再買)，應該無條件更新，不是只在>0時才更新。
+        auto_state["capital"]=available_after_settlement
+        cap_info={"account":str(stock_account),"balance":balance,"available":avail,
                 "pending_settlement":pending_settlement,
                 "available_after_settlement":available_after_settlement}
+        auto_state["capital_info"]=cap_info  # 持久化存起來，前端點"資金已同步"那行log時可以隨時查詢最新明細
+        return cap_info
     except Exception as e:
         logger.warning(f"刷新可用資金失敗: {e}")
         return None
@@ -1487,7 +850,7 @@ def get_status():
         "auto_enabled":auto_state["enabled"],
         "paper_mode":auto_state.get("paper_mode",True),
         "daily_pnl":round(auto_state["daily_pnl"],0),
-        "daily_pnl_pct":round(auto_state["daily_pnl"]/auto_state["capital"]*100,2),
+        "daily_pnl_pct":round(auto_state["daily_pnl"]/(auto_state["capital"] or 1)*100,2),
         "win_rate":wr,
         "daily_trades":auto_state["daily_trades"],
         "positions_count":len(auto_state["positions"]),
@@ -1544,7 +907,7 @@ async def connect(req:ConnectRequest, background_tasks:BackgroundTasks):
             logger.warning(f"OFI callback註冊失敗，真實OFI將停用(extract_ml_features會用0中性值): {e}")
         ofi_symbols=list(set(auto_state["watchlist"]) | set(SCAN_UNIVERSE))
         def _do_ofi_subscribe():
-            n_ok=subscribe_ofi_symbols(ofi_symbols)
+            n_ok=subscribe_ofi_symbols(ofi_symbols, api, auto_state)
             _log(f"OFI即時訂閱完成：{n_ok}/{len(ofi_symbols)}檔成功"+("" if n_ok==len(ofi_symbols) else "（有股票訂閱失敗，那些股票的order_flow特徵會用0中性值代替，看log warning找原因）"))
         background_tasks.add_task(_do_ofi_subscribe)
         return {"success":True,"stock_account":str(stock_account) if stock_account else None,
@@ -1559,7 +922,7 @@ async def disconnect():
     global sinopac_api,stock_account,future_account
     auto_state["enabled"]=False
     try:
-        unsubscribe_all_ofi()  # 模組一：登出前先取消tick訂閱、清空OFI狀態，避免殘留訂閱占用額度
+        unsubscribe_all_ofi(sinopac_api)  # 模組一：登出前先取消tick訂閱、清空OFI狀態，避免殘留訂閱占用額度
         if sinopac_api: sinopac_api.logout()
         sinopac_api=stock_account=future_account=None
         return {"success":True}
@@ -1571,6 +934,11 @@ async def disconnect():
 async def auto_start(req:AutoStartRequest):
     if not sinopac_api:
         raise HTTPException(status_code=401,detail="請先連接永豐帳戶")
+    if req.risk not in RISK_CFG:
+        # 修正：原本沒驗證就直接存進auto_state["risk"]，無效值(打錯字/前端bug/任何非low/mid/high的字串)
+        # 會在下一次auto_trade_tick讀RISK_CFG[auto_state["risk"]]時直接KeyError，每30秒crash一次，
+        # 而且要等到那個時候才會發現問題——在這裡就先擋掉，啟動當下就清楚告知，不要讓壞資料進到狀態裡。
+        raise HTTPException(status_code=400,detail=f"無效的risk參數: {req.risk!r}，必須是 {list(RISK_CFG.keys())} 其中之一")
     # 修正⑥：剛調整完邏輯/股票池/風險參數，不應該直接切真錢下單賭一次。
     # 要求至少先用「模擬模式」實際跑出 PAPER_VALIDATION_MIN_TRADES 筆完整交易、
     # 且跨過 PAPER_VALIDATION_MIN_DAYS 個不同交易日，才放行切換成真實下單；
@@ -1611,7 +979,7 @@ async def reset_daily_stats():
     auto_state.update({
         "daily_pnl":0.0,"daily_win":0,"daily_trades":0,
         "consec_loss":0,"pause_until":0,
-        "_loss_stop_logged":False,"_profit_lock_logged":False,"_afford_warn_logged":False,
+        "_loss_stop_logged":False,"_profit_lock_logged":False,"_afford_warn_logged":False,"_zero_capital_logged":False,
         "trade_history":[],
     })
     _log("使用者手動清空今日統計，重新開始記錄")
@@ -1621,6 +989,7 @@ async def reset_daily_stats():
 @app.get("/auto/status")
 async def auto_status():
     return {**auto_state,"market":market_status(),
+            "paper_available_capital":round(get_paper_available_capital(),2),
             "price_cache_size":{k:len(v) for k,v in price_cache.items()},
             "watchdog":{"seconds_since_tick":round(time.time()-_watchdog_state["last_tick_at"],1),
                         "alerted":_watchdog_state["alerted"]}}
@@ -1650,9 +1019,28 @@ async def update_watchlist(watchlist:List[str]):
     auto_state["watchlist"]=watchlist
     _persist_auto_state()
     if sinopac_api:  # 模組一：自選股新增的股票也要補訂閱OFI，不然extract_ml_features對它們永遠拿不到即時OFI
-        n_ok=subscribe_ofi_symbols(watchlist)
+        n_ok=subscribe_ofi_symbols(watchlist, sinopac_api, auto_state)
         if n_ok>0: _log(f"自選股更新，補訂閱OFI {n_ok}檔")
     return {"success":True,"watchlist":watchlist}
+
+class PaperCapitalRequest(BaseModel):
+    amount:float
+
+@app.put("/auto/paper-capital")
+async def set_paper_capital(req:PaperCapitalRequest):
+    """設定模擬資金總額。這個資金完全獨立於真實永豐帳戶，模擬模式的部位大小用這個算，
+    不會被真實帳戶的T+2交割卡住——也就是使用者可以放心拿一個夠大的模擬資金(例如預設1000萬)
+    去跑驗證，不需要真的有那麼多錢在永豐帳戶裡。"""
+    if req.amount<=0:
+        raise HTTPException(status_code=400,detail="模擬資金必須大於0")
+    if auto_state["positions"]:
+        _log(f"[提示]目前有{len(auto_state['positions'])}筆模擬持倉仍開著，調整模擬資金不會回溯影響這些持倉的成本計算，"
+             f"建議先平倉或等自然出場後再調整，避免帳本對不齊")
+    auto_state["paper_capital"]=req.amount
+    auto_state["paper_pending_settlements"]=[]  # 重設基準，連帶清空交割中紀錄，避免新舊金額混在一起搞混
+    _persist_auto_state()
+    _log(f"模擬資金已調整為NT${req.amount:,.0f}")
+    return {"success":True,"paper_capital":auto_state["paper_capital"]}
 
 # ── ML 模型預測同步（前端訓練完成後呼叫，讓後端下單邏輯參考ML判斷）──────
 class MLPredictionsRequest(BaseModel):
