@@ -1,0 +1,9 @@
+# 修正LightGBM在Railway上載入失敗的問題：
+# LightGBM的pip wheel依賴libgomp.so.1(GNU OpenMP執行函式庫)，但官方wheel沒有把它打包進去
+# (這是LightGBM官方GitHub已知issue：microsoft/LightGBM#4484、#7141)，
+# 預設的Railway/Nixpacks建置環境沒有這個系統函式庫，所以載入時會報
+# "libgomp.so.1: cannot open shared object file"。
+# 這裡用aptPkgs額外安裝Debian/Ubuntu的libgomp1套件(這個函式庫在apt生態系裡的標準名稱)，
+# 用"..."讓它疊加在Nixpacks原本自動偵測到的Python建置流程上，不會覆蓋掉現有設定。
+[phases.setup]
+aptPkgs = ['...', 'libgomp1']
