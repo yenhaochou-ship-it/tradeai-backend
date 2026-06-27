@@ -188,7 +188,6 @@ def watchdog_check():
 
 _last_cum_volume: Dict[str,int] = {}  # 修正：追蹤每檔股票上次輪詢時的累計成交量，用來換算成「這次輪詢期間」的增量
 MAX_BARS = 120
-ml_predictions: Dict[str,float] = {}  # {symbol: 0~1 預測勝率} 由前端訓練完成後同步
 # (SCAN_UNIVERSE/SECTOR_MAP 已從config.py匯入)
 
 # ── 個股合約資訊快取（當沖資格 day_trade、漲跌停價，每日更新一次，避免重複查詢）──
@@ -1053,49 +1052,6 @@ async def set_paper_capital(req:PaperCapitalRequest):
     _log(f"模擬資金已調整為NT${req.amount:,.0f}")
     return {"success":True,"paper_capital":auto_state["paper_capital"]}
 
-# ── ML 模型預測同步（前端訓練完成後呼叫，讓後端下單邏輯參考ML判斷）──────
-class MLPredictionsRequest(BaseModel):
-    predictions: Dict[str,float]  # {symbol: 0~1 預測勝率}
-
-@app.post("/ml/predictions")
-async def update_ml_predictions(req:MLPredictionsRequest):
-    global ml_predictions
-    ml_predictions=req.predictions
-    _log(f"ML模型預測已同步 | {len(ml_predictions)}支股票")
-    return {"success":True,"count":len(ml_predictions)}
-
-@app.get("/ml/predictions")
-async def get_ml_predictions():
-    return ml_predictions
-
-# ── AI學習狀態持久化（信心度/勝率/連勝/自適應權重，存在後端不會因換裝置或清快取而重置）──
-learn_state_store: Dict = db_load("learn_state", {})  # 啟動時從資料庫還原（若已掛載Volume，跨重新部署也保留）
-
-@app.post("/learn/state")
-async def save_learn_state(state: Dict):
-    global learn_state_store
-    learn_state_store = state
-    db_save("learn_state", state)
-    return {"success": True}
-
-@app.get("/learn/state")
-async def get_learn_state():
-    return learn_state_store or {}
-
-# ── ML 神經網路模型權重持久化（存資料庫，換裝置/清瀏覽器快取/後端重新部署都不會丟失訓練成果，前提是已掛載Volume）──
-ml_model_store: Dict = db_load("ml_model", {})
-
-@app.post("/ml/model")
-async def save_ml_model(model: Dict):
-    global ml_model_store
-    ml_model_store = model
-    db_save("ml_model", model)
-    return {"success": True}
-
-@app.get("/ml/model")
-async def get_ml_model():
-    return ml_model_store or {}
-
 # ── 交易成本試算（含手續費+當沖證交稅）──────────────────────────────
 @app.get("/fees/calc")
 async def calc_fees(entry_price:float,exit_price:float,qty:int=1000):
@@ -1187,12 +1143,20 @@ async def get_positions():
                 ap  =float(getattr(p,"price",0) or getattr(p,"avg_price",0))
                 lp  =float(getattr(p,"last_price",0) or getattr(p,"close",0))
                 pnl =float(getattr(p,"pnl",0))
-                direction=str(getattr(p,"direction","Buy"))
+                # 修正：Shioaji的direction是Action enum(<Action.Buy: 'Buy'>)，Python對enum預設
+                # str()出來是"Action.Buy"不是單純"Buy"，跟"Buy"做exact match永遠不會相等，
+                # 導致這裡一直誤判成空單方向，連帶讓下面pnl_percent的正負號整個顛倒——
+                # 螢幕上看到0050明明虧錢卻顯示正的百分比，009816明明賺錢卻顯示負的，就是這個原因。
+                # 改成看字串裡有沒有包含"buy"(不分大小寫)，不管Shioaji回傳的是"Buy"、"Action.Buy"
+                # 哪一種形式都抓得到，同時把存進結果的direction清理成乾淨的"Buy"/"Sell"給前端用。
+                direction_raw=str(getattr(p,"direction","Buy"))
+                is_long="buy" in direction_raw.lower()
+                direction="Buy" if is_long else "Sell"
                 # 修正：getattr(p,"pnl_percent",0)在永豐回傳的真實持倉物件上一直拿不到值，
                 # 每次都是落到預設值0(不是真的算出來是0%，是這個屬性名稱在Shioaji物件上根本不存在，
                 # 螢幕上看到兩筆不同損益的持倉同時顯示+0.00%就是這個落空預設值的症狀)。
                 # 改成直接用均價/現價自己算，不依賴猜測屬性名稱對不對，long/short方向都正確處理。
-                pnlp=((lp-ap)/ap*100 if direction=="Buy" else (ap-lp)/ap*100) if ap else 0.0
+                pnlp=((lp-ap)/ap*100 if is_long else (ap-lp)/ap*100) if ap else 0.0
                 result.append({"symbol":code,"name":getattr(p,"name",code),"quantity":qty,
                     "avg_price":ap,"current_price":lp,"pnl":pnl,"pnl_percent":round(pnlp,2),
                     "direction":direction,"value":lp*qty if lp else ap*qty})
