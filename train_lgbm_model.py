@@ -24,13 +24,39 @@ train_lgbm_model.py — 訓練「做多勝率」LightGBM模型，供 main.py 的
 5. 訓練完成會在當前目錄產生 lgbm_model.txt，把這個檔案放到後端服務的工作目錄
    （跟main.py同一層，或設定LGBM_MODEL_PATH環境變數指向它），重啟/重新部署後端即可生效。
 
+═══════════════════════════════════════════════════════════════════════════
+多久該重新訓練一次？要不要排程自動做？
+═══════════════════════════════════════════════════════════════════════════
+目前刻意設計成「手動執行」，沒有排程自動重訓+自動換模型上線——理由：模型還沒有任何真實
+驗證紀錄之前，自動把一個沒人看過的新模型直接換上正在跑的交易系統，等於拿掉了人在最關鍵
+決策點上的把關。建議的節奏：累積完一輪20筆/5天的模擬驗證後，手動重新訓練一次，看下面
+「新舊模型比較」的結果再決定要不要換。之後如果累積了更穩定的真實績效記錄，要不要做成
+自動排程(可以掛在main.py現有的APScheduler裡，跟auto_trade_tick同一套機制)是合理的下一步，
+但那時候才有真正的歷史表現可以拿來判斷「自動換模型」這個動作本身值不值得信任。
+
+═══════════════════════════════════════════════════════════════════════════
+合併真實交易資料一起訓練（不是續訓，是從零重新訓練；--feature-log-csv）
+═══════════════════════════════════════════════════════════════════════════
+先從/auto/feature_log.csv下載累積的真實(或模擬)交易紀錄，然後：
+   python train_lgbm_model.py --feature-log-csv paper_test_data.csv
+這會把真實交易資料跟歷史重建資料合併成同一個訓練集，從零開始一起訓練——不是用LightGBM的
+init_model續訓機制。原因是實測過：續訓的方式在「歷史資料這個特徵固定是0、真實資料這個特徵
+才有真實數值」的情境下(目前OFI/價差正是這種情況)，新加的樹完全學不會用這個特徵
+(驗證集AUC只有0.484，等於瞎猜)；合併後從零訓練則能正確學會(AUC可以到0.8以上)。
+真實資料樣本少，用--real-data-weight-fraction調整它在訓練時的權重佔比(預設30%)，
+這個數字沒有校準過，是合理起點。
+
+訓練完會自動跟現在部署中的舊模型(或--compare-with指定的檔案)在同一份驗證集上比較AUC，
+清楚印出新模型是更好還是更差——這個比較不會自動阻止存檔，但請先看過結果再決定要不要
+真的把這次訓練出來的lgbm_model.txt複製過去覆蓋線上的版本。
+
 標籤定義（Triple Barrier，用「中風險」的停損停利/持倉上限當基準）：
 進場後在 max_hold_min 分鐘內，價格先碰到 +tp% 算成功(1)，先碰到 -sl% 算失敗(0)，
 兩者都沒碰到就看 max_hold_min 結束時是否有達到 min_profitable_move_pct 算成功，否則失敗。
 這個基準是「中風險」設定，不代表你實際運行的風險等級——模型預測的是相對普適的「做多品質」，
 各風險等級在main.py用各自的min_conf門檻去比這個機率，門檻越高代表要求越嚴格。
 """
-import argparse, os, sys, time
+import argparse, os, sys, bisect
 from datetime import datetime, timedelta, timezone
 
 TW_TZ = timezone(timedelta(hours=8))
@@ -78,7 +104,6 @@ def calc_signal_py(prices, volumes):
     price = prices[-1]
     ma5   = sum(prices[-5:])/5
     ma20  = sum(prices[-20:])/20
-    ma50  = sum(prices[-50:])/50 if len(prices)>=50 else ma20
     rsi_arr = _calc_rsi(prices)
     rsi = rsi_arr[-1]
     vp,vv = prices[-20:], (volumes[-20:] if volumes else [1e6]*20)
@@ -190,10 +215,38 @@ ML_FEATURE_NAMES=[
     # 歷史kbars沒有逐筆tick/委託簿資料，沒辦法回溯算出真實OFI/大單流，訓練時這2個特徵也是常數0，
     # 模型一樣學不到怎麼用它們。等之後有辦法收集到歷史tick資料(api.ticks()可查單日逐筆，
     # 但沒有bid/ask五檔，只有bid_price/ask_price當時的最佳一檔)，可以考慮另外補做歷史OFI重建。
+    "spread_pct",  # 一樣是0：歷史kbars沒有bid/ask，跟上面OFI同樣的限制
+    "market_return_5m_pct",  # 這個跟上面不一樣——0050的歷史K棒抓得到，下面build_dataset()有真的算出來，不是固定0
+    "time_of_day_pct",  # 跟market_return_5m_pct一樣不是固定值——純時間運算，歷史資料的ts本來就有，直接算
 ]
+MARKET_INDEX_SYMBOL="0050"
 
-def extract_ml_features(sym, prices, volumes, entries, dir_="L"):
-    """跟main.py的extract_ml_features()邏輯完全一致，差別只是entries當參數傳入(訓練時逐筆切片效率較好)"""
+def get_time_of_day_pct(ts):
+    """跟main.py的get_time_of_day_pct()邏輯完全一致。訓練時傳進來的ts是歷史K棒當時的真實時間戳，
+    不是"現在"——這樣訓練出來的「早盤/尾盤」型態學習才會對應到歷史上真實發生的時段，不是亂套用。"""
+    dt=datetime.fromtimestamp(ts,tz=TW_TZ)
+    minutes=dt.hour*60+dt.minute-9*60
+    return round(max(0.0,min(1.0,minutes/270)),3)
+
+def get_market_context_at(market_entries, market_ts_list, current_ts):
+    """跟main.py的get_market_context()邏輯一致，但訓練時必須只看「當下這個時間點之前」的0050價格，
+    不能用到未來資料(lookahead bias)——不然等於用還沒發生的大盤走勢去訓練模型，評估出來的準確度會是假的。
+    效能：market_entries本身就是按時間排好的(來自fetch_1min_bars)，用bisect在已排序時間戳清單裡
+    二分搜尋切點是O(log n)，比原本每次呼叫都用list comprehension整個filter一遍的O(n)快得多——
+    這個函式會被每一個訓練樣本呼叫一次，資料量大時(例如抓90天、好幾十檔股票)差異會很明顯。"""
+    if not market_entries: return None
+    idx=bisect.bisect_right(market_ts_list,current_ts)
+    past=market_entries[:idx]
+    m5=_bucket_closes(past,300)
+    if len(m5)<4: return None
+    base=m5[-4]
+    if not base: return None
+    return round((m5[-1]-base)/base*100,3)
+
+def extract_ml_features(sym, prices, volumes, entries, dir_="L", market_return_5m_pct=None, time_of_day_pct=None):
+    """跟main.py的extract_ml_features()邏輯完全一致，差別只是entries當參數傳入(訓練時逐筆切片效率較好)，
+    market_return_5m_pct/time_of_day_pct是外部算好傳進來的(跨股票共用的0050資料跟時間運算，
+    不適合塞在單一股票的特徵函式內部算)"""
     if len(prices)<30: return None
     sig=calc_signal_py(prices,volumes)
     regime=classify_market_regime(prices)
@@ -214,7 +267,10 @@ def extract_ml_features(sym, prices, volumes, entries, dir_="L"):
         _REGIME_CODE.get(regime["regime"],0), mtf_code,
         vq.get("score",50), vq.get("bid_ask_imbalance",0),
         of.get("delta_recent",0)/1000.0, orb_hit,
-        0.0, 0.0,  # real_ofi_ema, real_big_trade_scaled：歷史資料沒有，固定填中性值0
+        0.0, 0.0,  # real_ofi_interval, real_big_trade_interval_scaled：歷史資料沒有，固定填中性值0
+        0.0,  # spread_pct：歷史資料沒有，固定填中性值0
+        market_return_5m_pct if market_return_5m_pct is not None else 0.0,
+        time_of_day_pct if time_of_day_pct is not None else 0.0,
     ]
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -261,20 +317,30 @@ def build_dataset(api, symbols, days, stride=5):
     """對每檔股票，每隔stride根棒子取一個樣本點(不用每一根都取，減少高度重疊的樣本、加快訓練)，
     算特徵+標籤，組成完整訓練資料。"""
     X, y, meta = [], [], []
+    # 先抓0050的歷史K棒，用來算每個樣本點當下的「大盤同步性」特徵——只抓一次，所有股票共用，
+    # 不是每檔股票各自抓一份(0050的走勢對所有股票來說是同一份外部資料，不需要重複抓)。
+    print("抓取大盤代理指標(0050)歷史資料...")
+    market_bars = fetch_1min_bars(api, MARKET_INDEX_SYMBOL, days)
+    market_entries = [{"price": b["close"], "t": b["ts"]} for b in market_bars]
+    market_ts_list = [e["t"] for e in market_entries]  # 給bisect用，預先抽出時間戳清單，不用每次呼叫都重新建一份
+    if not market_entries:
+        print("  ⚠️ 抓不到0050資料，market_return_5m_pct這個特徵這次訓練會固定是0(中性值)")
     for sym in symbols:
         bars = fetch_1min_bars(api, sym, days)
         if len(bars) < 60:
             continue
         # 把bars轉成extract_ml_features需要的entries格式（沒有tick_type/buy_vol/sell_vol，
         # 因為kbars歷史資料沒有這些欄位——這跟main.py即時推論時的特徵會有落差，這是已知限制，
-        # 見下方"已知限制"說明，先用0/None代替，模型還是能從其他10個特徵學到東西）
+        # 見下方"已知限制"說明，先用0/None代替，模型還是能從其他特徵學到東西）
         entries = [{"price": b["close"], "volume": b["volume"], "t": b["ts"],
                     "buy_vol": None, "sell_vol": None, "tick_type": 0} for b in bars]
         prices_all = [b["close"] for b in bars]
         volumes_all = [b["volume"] for b in bars]
         n_samples_this_sym = 0
         for i in range(30, len(bars) - LABEL_MAX_HOLD_MIN - 1, stride):
-            feats = extract_ml_features(sym, prices_all[:i+1], volumes_all[:i+1], entries[:i+1], "L")
+            mkt_ret = get_market_context_at(market_entries, market_ts_list, bars[i]["ts"])
+            tod_pct = get_time_of_day_pct(bars[i]["ts"])
+            feats = extract_ml_features(sym, prices_all[:i+1], volumes_all[:i+1], entries[:i+1], "L", mkt_ret, tod_pct)
             if feats is None: continue
             label = label_triple_barrier(bars, i)
             X.append(feats); y.append(label)
@@ -287,12 +353,54 @@ def build_dataset(api, symbols, days, stride=5):
 # 主程式
 # ═══════════════════════════════════════════════════════════════════════════
 
+def load_real_feature_log(csv_path):
+    """讀取從/auto/feature_log.csv下載的真實交易紀錄，轉成(X_real, y_real)。
+    這份資料樣本少，但OFI/價差/大盤同步性都是真實數值(不是歷史重建那種固定填0)，
+    是目前唯一能讓模型真正學會用這幾個特徵的資料來源。"""
+    import csv as csv_module
+    X_real, y_real = [], []
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv_module.DictReader(f)
+        for row in reader:
+            try:
+                feats = [float(row[name]) for name in ML_FEATURE_NAMES]
+                label = int(row["win"])
+            except (KeyError, ValueError):
+                continue  # 欄位缺失或格式不對的列跳過，不要讓一筆壞資料擋掉整批
+            X_real.append(feats); y_real.append(label)
+    return X_real, y_real
+
+def evaluate_model_file(model_path, X_valid, y_valid):
+    """載入一個既有模型檔案，在同一份驗證集上算AUC，用來跟新訓練的模型比較。
+    檔案不存在/載入失敗都回傳None，呼叫端要當作「沒有舊模型可比較」處理，不要當成錯誤。"""
+    import lightgbm as lgb
+    from sklearn.metrics import roc_auc_score
+    if not os.path.exists(model_path): return None
+    try:
+        old_model = lgb.Booster(model_file=model_path)
+        pred = old_model.predict(X_valid)
+        return roc_auc_score(y_valid, pred)
+    except Exception as e:
+        print(f"  ⚠️ 無法載入比較模型 {model_path}: {e}")
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="訓練LightGBM做多勝率模型")
     ap.add_argument("--symbols", nargs="*", default=None, help="只訓練這幾檔(預設用完整SCAN_UNIVERSE)")
     ap.add_argument("--days", type=int, default=90, help="抓多少天的歷史資料(預設90天)")
     ap.add_argument("--stride", type=int, default=5, help="每隔幾根棒子取一個樣本(預設5)")
     ap.add_argument("--output", default="lgbm_model.txt", help="模型輸出路徑")
+    ap.add_argument("--feature-log-csv", default=None,
+                     help="從/auto/feature_log.csv下載的真實交易紀錄路徑。提供的話會跟歷史重建資料合併"
+                          "一起從零訓練(不是續訓)，讓模型有機會學會用OFI/價差這幾個歷史資料裡固定是0的特徵。")
+    ap.add_argument("--real-data-weight-fraction", type=float, default=0.3,
+                     help="真實交易資料在合併訓練時佔的權重比例(預設0.3=30%%)，不是樣本數比例——"
+                          "樣本數通常少很多，用權重讓它在訓練時的影響力不會被歷史資料的數量淹沒。"
+                          "這個數字沒有校準過，是合理起點，建議多跑幾次、觀察AUC變化再調整。")
+    ap.add_argument("--compare-with", default=None,
+                     help="拿新訓練的模型跟這個既有模型檔案比較AUC(預設跟--output同一個路徑比，"
+                          "也就是跟現在正在用/即將被覆蓋的那個模型比較)")
     args = ap.parse_args()
 
     symbols = args.symbols or SCAN_UNIVERSE
@@ -311,7 +419,7 @@ def main():
     print("✓ 連線成功，開始抓取歷史資料並建立特徵...")
 
     X, y, meta = build_dataset(api, symbols, args.days, args.stride)
-    print(f"\n總樣本數: {len(X)} | 正樣本(做多成功)比例: {sum(y)/len(y)*100:.1f}%" if y else "⚠️ 沒有抓到任何樣本")
+    print(f"\n歷史重建樣本數: {len(X)} | 正樣本(做多成功)比例: {sum(y)/len(y)*100:.1f}%" if y else "⚠️ 沒有抓到任何樣本")
     if len(X) < 200:
         print("⚠️ 樣本數太少(<200)，模型品質會很差，建議增加--days或檢查資料來源是否正常")
         if len(X) == 0:
@@ -322,12 +430,48 @@ def main():
     from sklearn.metrics import roc_auc_score, accuracy_score
 
     X = np.array(X); y = np.array(y)
-    # 用時間順序切分train/valid(不能隨機shuffle，否則用未來資料預測過去=資料洩漏)
+    # 用時間順序切分train/valid(不能隨機shuffle，否則用未來資料預測過去=資料洩漏)。
+    # 注意：這裡先把歷史資料自己切好train/valid，還沒跟真實資料合併——
+    # 如果是合併完「歷史+真實」整批再切80/20，因為真實資料是後面才append上去的一小段，
+    # 時間順序切割會讓真實資料幾乎全部被切進valid那20%，train那80%可能完全沒有真實樣本，
+    # 等於白白合併了卻沒有真的拿真實資料去訓練(這個問題用合成資料實測抓到過，AUC會掉到0.475，
+    # 跟完全沒合併一樣差，一定要先各自切好才合併，不能合併後再切)。
     split = int(len(X) * 0.8)
     X_train, X_valid = X[:split], X[split:]
     y_train, y_valid = y[:split], y[split:]
+    w_train = np.ones(len(X_train))  # 歷史重建資料權重固定1，下面合併真實資料時只調整真實資料那邊的權重
 
-    train_data = lgb.Dataset(X_train, label=y_train, feature_name=ML_FEATURE_NAMES)
+    # 合併真實交易資料(如果有提供)——不是續訓，是把兩份資料當作同一個訓練集，從零開始一起訓練。
+    # 上次實測過用init_model續訓的方式，模型完全學不會用OFI這種「歷史資料固定0、真實資料才有值」
+    # 的特徵(驗證集AUC只有0.484，等於瞎猜)；合併後從零訓練的方式則能正確學會(AUC 0.862)。
+    if args.feature_log_csv:
+        print(f"\n讀取真實交易紀錄: {args.feature_log_csv}")
+        X_real, y_real = load_real_feature_log(args.feature_log_csv)
+        if not X_real:
+            print("  ⚠️ 沒有讀到任何真實交易樣本(檔案是空的或格式不對)，本次訓練只用歷史重建資料")
+        else:
+            print(f"  讀到{len(X_real)}筆真實交易樣本，正樣本比例: {sum(y_real)/len(y_real)*100:.1f}%")
+            if len(X_real) < 20:
+                print(f"  ⚠️ 真實樣本只有{len(X_real)}筆，遠少於20筆驗證門檻，這次合併訓練的效果還是有限，"
+                      f"參考用就好，不要太相信合併後的結果")
+            X_real = np.array(X_real); y_real = np.array(y_real)
+            # 真實資料也用一樣的時間順序邏輯各自切train/valid，再分別併進對應的train/valid，
+            # 不是合併後再切——這樣train一定會看到真實樣本，valid也會看到，兩邊都不會是空的。
+            split_real = max(1, int(len(X_real) * 0.8)) if len(X_real) >= 5 else len(X_real)
+            X_real_train, X_real_valid = X_real[:split_real], X_real[split_real:]
+            y_real_train, y_real_valid = y_real[:split_real], y_real[split_real:]
+            # 用權重讓真實資料的「總影響力」達到指定比例，不是直接看樣本數比例——
+            # 樣本數通常差幾十倍，沒有調權重的話歷史資料會完全淹沒真實資料的訊號。
+            frac = args.real_data_weight_fraction
+            w_real_each = (frac * len(X_train)) / max(1,((1-frac) * len(X_real_train)))
+            print(f"  真實資料每筆權重: {w_real_each:.2f}(讓真實資料佔總訓練權重約{frac*100:.0f}%)；"
+                  f"train併入{len(X_real_train)}筆、valid併入{len(X_real_valid)}筆")
+            X_train = np.vstack([X_train, X_real_train]); y_train = np.concatenate([y_train, y_real_train])
+            w_train = np.concatenate([w_train, np.full(len(X_real_train), w_real_each)])
+            if len(X_real_valid) > 0:
+                X_valid = np.vstack([X_valid, X_real_valid]); y_valid = np.concatenate([y_valid, y_real_valid])
+
+    train_data = lgb.Dataset(X_train, label=y_train, weight=w_train, feature_name=ML_FEATURE_NAMES)
     valid_data = lgb.Dataset(X_valid, label=y_valid, feature_name=ML_FEATURE_NAMES, reference=train_data)
     params = {
         "objective": "binary", "metric": "auc", "verbosity": -1,
@@ -341,15 +485,34 @@ def main():
     pred_valid = model.predict(X_valid)
     auc = roc_auc_score(y_valid, pred_valid)
     acc = accuracy_score(y_valid, (pred_valid >= 0.5).astype(int))
-    print(f"\n=== 驗證集表現 ===\nAUC: {auc:.3f} (0.5=瞎猜, 越接近1越好, 通常0.55~0.65已經算有用)")
+    print(f"\n=== 新模型驗證集表現 ===\nAUC: {auc:.3f} (0.5=瞎猜, 越接近1越好, 通常0.55~0.65已經算有用)")
     print(f"準確率: {acc:.3f}")
     print("\n=== 特徵重要性 ===")
     importance = sorted(zip(ML_FEATURE_NAMES, model.feature_importance()), key=lambda x: -x[1])
     for name, imp in importance:
         print(f"  {name}: {imp}")
 
+    # 安全網：拿新模型跟現在實際部署/即將被覆蓋的舊模型在同一份驗證集上比較，
+    # 不自動阻擋儲存(你可能還是想看看新模型長怎樣)，但會把結果講清楚，不要悶著頭直接換上去。
+    compare_path = args.compare_with or args.output
+    old_auc = evaluate_model_file(compare_path, X_valid, y_valid)
+    print("\n=== 新舊模型比較 ===")
+    if old_auc is None:
+        print(f"沒有找到既有模型({compare_path})可比較，這應該是第一次訓練。")
+    else:
+        diff = auc - old_auc
+        print(f"舊模型({compare_path}) AUC: {old_auc:.3f}")
+        print(f"新模型 AUC: {auc:.3f}（差異 {diff:+.3f}）")
+        if diff < -0.02:
+            print("⚠️⚠️⚠️ 新模型比舊模型明顯更差，不建議用這次訓練的結果覆蓋現在的模型！")
+            print("   建議檢查這次的資料/參數是否有問題，或暫時保留舊模型繼續使用。")
+        elif diff < 0:
+            print("新模型略差於舊模型，差異不算大，但建議謹慎，可以多訓練幾次看看穩不穩定再決定要不要換。")
+        else:
+            print("✅ 新模型不差於舊模型，可以考慮用這次的結果替換。")
+
     model.save_model(args.output)
-    print(f"\n✅ 模型已存到 {args.output}")
+    print(f"\n✅ 模型已存到 {args.output}（上面的新舊比較結果請先看過，再決定要不要部署這個檔案）")
     print("把這個檔案放到後端服務工作目錄(跟main.py同一層)，重啟/重新部署後端即可生效。")
     if auc < 0.55:
         print("\n⚠️ AUC接近0.5，代表模型幾乎沒有預測力，不建議直接上線使用——")

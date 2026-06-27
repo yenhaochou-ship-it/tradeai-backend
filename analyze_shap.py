@@ -38,6 +38,7 @@ ML_FEATURE_NAMES=[
     "regime_code","mtf_aligned_code",
     "volume_quality_score","bid_ask_imbalance","order_flow_delta_scaled","orb_breakout",
     "real_ofi_interval","real_big_trade_interval_scaled",
+    "spread_pct","market_return_5m_pct","time_of_day_pct",
 ]
 
 def main():
@@ -99,7 +100,6 @@ def main():
     # ── 圖形輸出 ──
     if not args.no_plot:
         try:
-            import matplotlib
             shap.summary_plot(shap_values,X,plot_type="bar",show=False)
             import matplotlib.pyplot as plt
             plt.tight_layout(); plt.savefig("shap_summary.png",dpi=150)
