@@ -46,7 +46,7 @@ from signals import (
 from ml_model import (
     ML_FEATURE_NAMES, predict_lgbm_confidence,
     lgbm_grade, calculate_dynamic_position_ratio,
-    build_entry_reason, build_exit_reason,
+    build_entry_reason, build_exit_reason, get_lgbm_model_status,
 )
 
 db_init()
@@ -986,10 +986,21 @@ async def reset_daily_stats():
     _persist_auto_state()
     return {"success":True,"state":auto_state}
 
+_model_status_logged=False
+
 @app.get("/auto/status")
 async def auto_status():
+    global _model_status_logged
+    lgbm_status=get_lgbm_model_status()
+    if not _model_status_logged:
+        _model_status_logged=True
+        if lgbm_status["loaded"]:
+            _log(f"✅ LightGBM模型已載入：{lgbm_status['path']}")
+        else:
+            _log(f"⚠️ LightGBM模型尚未載入：{lgbm_status['error']}")
     return {**auto_state,"market":market_status(),
             "paper_available_capital":round(get_paper_available_capital(),2),
+            "lgbm_model":lgbm_status,
             "price_cache_size":{k:len(v) for k,v in price_cache.items()},
             "watchdog":{"seconds_since_tick":round(time.time()-_watchdog_state["last_tick_at"],1),
                         "alerted":_watchdog_state["alerted"]}}

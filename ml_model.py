@@ -81,6 +81,14 @@ def extract_ml_features(sym:str, prices:List[float], volumes:List[float], dir_:s
 _lgbm_model={"booster":None,"loaded":False,"path":None,"error":None}
 LGBM_MODEL_PATH=os.environ.get("LGBM_MODEL_PATH","lgbm_model.txt")
 
+def get_lgbm_model_status() -> Dict:
+    """回傳目前模型載入狀態，供main.py的/auto/status轉發給前端顯示。
+    呼叫_load_lgbm_model()確保即使還沒有任何候選評估觸發過載入，也能立刻知道結果
+    (例如剛部署完，使用者想馬上確認模型有沒有載入成功，不用等到下次開盤評估候選股票才知道)。"""
+    _load_lgbm_model()
+    return {"loaded":_lgbm_model["booster"] is not None,
+            "path":_lgbm_model["path"],"error":_lgbm_model["error"]}
+
 def _load_lgbm_model():
     """惰性載入模型(第一次用到時才載入)，且把lightgbm的import包在function裡面而不是放在檔案最上面——
     這樣即使尚未在requirements.txt加上lightgbm套件、或還沒訓練出模型檔案，整個後端服務照樣能正常啟動，
