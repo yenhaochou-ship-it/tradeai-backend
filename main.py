@@ -1187,10 +1187,15 @@ async def get_positions():
                 ap  =float(getattr(p,"price",0) or getattr(p,"avg_price",0))
                 lp  =float(getattr(p,"last_price",0) or getattr(p,"close",0))
                 pnl =float(getattr(p,"pnl",0))
-                pnlp=float(getattr(p,"pnl_percent",0))
+                direction=str(getattr(p,"direction","Buy"))
+                # 修正：getattr(p,"pnl_percent",0)在永豐回傳的真實持倉物件上一直拿不到值，
+                # 每次都是落到預設值0(不是真的算出來是0%，是這個屬性名稱在Shioaji物件上根本不存在，
+                # 螢幕上看到兩筆不同損益的持倉同時顯示+0.00%就是這個落空預設值的症狀)。
+                # 改成直接用均價/現價自己算，不依賴猜測屬性名稱對不對，long/short方向都正確處理。
+                pnlp=((lp-ap)/ap*100 if direction=="Buy" else (ap-lp)/ap*100) if ap else 0.0
                 result.append({"symbol":code,"name":getattr(p,"name",code),"quantity":qty,
-                    "avg_price":ap,"current_price":lp,"pnl":pnl,"pnl_percent":pnlp,
-                    "direction":str(getattr(p,"direction","Buy")),"value":lp*qty if lp else ap*qty})
+                    "avg_price":ap,"current_price":lp,"pnl":pnl,"pnl_percent":round(pnlp,2),
+                    "direction":direction,"value":lp*qty if lp else ap*qty})
             except Exception as pe:
                 logger.warning(f"解析持倉失敗: {pe}")
         return result
