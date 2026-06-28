@@ -18,15 +18,20 @@ def tw_now():
 # 台股當沖真實交易成本（含手續費+證交稅，2026年現行費率）
 # ══════════════════════════════════════════════════════════════════
 FEE_RATE = 0.001425      # 手續費 0.1425%（買賣各收一次，未打折）
-FEE_DISCOUNT = 0.6       # 一般網路下單券商折扣約6折
+FEE_DISCOUNT = 0.6       # 預設折扣6折，僅作為「使用者還沒自己設定真實折扣前」的起始值——
+                         # 實際折扣每個人跟永豐談的不一樣(常見從1折到完全沒折扣都有)，
+                         # 真正生效的數字是auto_state["fee_discount"](可透過/auto/fee-discount設定)，
+                         # 這個常數只在main.py完全沒呼叫過設定、auto_state還沒這個欄位時當預設值用。
 DAYTRADE_TAX_RATE = 0.0015  # 當沖證交稅 0.15%（優惠至2027年底，賣出收一次）
 
-def calc_round_trip_cost(entry_price:float, exit_price:float, qty:int) -> dict:
-    """計算當沖一買一賣的真實成本（手續費x2 + 當沖證交稅）"""
+def calc_round_trip_cost(entry_price:float, exit_price:float, qty:int, fee_discount:float=FEE_DISCOUNT) -> dict:
+    """計算當沖一買一賣的真實成本（手續費x2 + 當沖證交稅）。fee_discount給未指定時退回模組預設值，
+    main.py應該傳入auto_state["fee_discount"](使用者實際設定的折扣)，而不是依賴這個預設值，
+    避免每個使用者實際拿到的券商折扣不一樣，卻全部都套用同一個假設的6折，造成損益估算系統性偏差。"""
     buy_amt  = entry_price*qty
     sell_amt = exit_price*qty
-    buy_fee  = max(20, buy_amt*FEE_RATE*FEE_DISCOUNT)
-    sell_fee = max(20, sell_amt*FEE_RATE*FEE_DISCOUNT)
+    buy_fee  = max(20, buy_amt*FEE_RATE*fee_discount)
+    sell_fee = max(20, sell_amt*FEE_RATE*fee_discount)
     tax      = sell_amt*DAYTRADE_TAX_RATE
     total_cost = buy_fee+sell_fee+tax
     gross_pnl  = sell_amt-buy_amt
@@ -34,9 +39,9 @@ def calc_round_trip_cost(entry_price:float, exit_price:float, qty:int) -> dict:
     return {"gross_pnl":gross_pnl,"total_cost":total_cost,"net_pnl":net_pnl,
             "buy_fee":buy_fee,"sell_fee":sell_fee,"tax":tax}
 
-def min_profitable_move_pct() -> float:
-    """當沖至少要漲跌多少%才能扣成本後還有獲利（含手續費折扣後約0.32%）"""
-    return (FEE_RATE*FEE_DISCOUNT*2 + DAYTRADE_TAX_RATE)*100
+def min_profitable_move_pct(fee_discount:float=FEE_DISCOUNT) -> float:
+    """當沖至少要漲跌多少%才能扣成本後還有獲利。同樣接受fee_discount覆寫，理由跟上面一致。"""
+    return (FEE_RATE*fee_discount*2 + DAYTRADE_TAX_RATE)*100
 
 # ══════════════════════════════════════════════════════════════════
 # 國定假日休市表：原本只用 weekday()>=5 排掉週末，國定假日（春節、228、兒童節等）落在平日時

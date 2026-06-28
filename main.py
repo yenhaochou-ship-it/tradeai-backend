@@ -69,6 +69,10 @@ _auto_state_defaults = {
     # 記錄每筆平倉後還在交割中(T+2)的金額，可用金額=paper_capital減去還沒交割完成的部分。
     "paper_capital":10_000_000.0,
     "paper_pending_settlements":[],  # [{"amount":float,"settle_date":"YYYY-MM-DD"}, ...]
+    # 券商手續費折扣：每個人跟永豐談的實際折扣不一樣(常見1折~無折扣都有)，預設用config.py
+    # 的6折只是個起始假設，不是每個人的真實數字——可透過/auto/fee-discount設定成自己實際拿到的折扣，
+    # 這個數字會直接影響所有損益試算跟「至少要漲跌多少%才划算」的門檻是否準確。
+    "fee_discount":FEE_DISCOUNT,
     "daily_pnl":0.0,"daily_win":0,"daily_trades":0,
     "consec_loss":0,"pause_until":0,"trade_date":None,
     "_loss_stop_logged":False,"_profit_lock_logged":False,"_afford_warn_logged":False,"_zero_capital_logged":False,
@@ -443,7 +447,7 @@ def auto_trade_tick():
         # 導致價格幾乎沒動也會被「持倉超時」強制出場，穩定倒貼一次完整成本（例：原價買賣的台積電單，0%價差卻虧NT$8,089手續費）。
         # 改成要求至少要爬到「扣成本後打平」的幅度才放它走；沒到的話繼續抱著，交給停損/止盈/反轉訊號決定，
         # 最晚 13:20 還有 force_close_all 強制收尾，不會有隔夜風險。
-        min_move=min_profitable_move_pct()
+        min_move=min_profitable_move_pct(auto_state.get("fee_discount",FEE_DISCOUNT))
         time_up=held_min>=cfg.get("max_hold_min",40) and pp>=min_move
         # 移動停利：獲利超過1.5%後啟動，停損價跟隨移動鎖定部分獲利（新倉只會是多單，但保留方向判斷以正確處理限制前就存在的舊空單）
         # 修正：原本回檔寬度1.2%，跟1.5%啟動門檻太接近，剛啟動時的安全margin只有0.3%，
@@ -481,7 +485,7 @@ def auto_trade_tick():
             shares = pos["qty"] * 1000
             fill_p=_apply_slippage(p,is_buy=False)  # 模擬滑價：賣出假設要少收1個tick(觸發出場後的真實成交價，不是觸發判斷本身)
             entry_p,exit_p = (pos["entry"],fill_p) if pos["dir"]=="L" else (fill_p,pos["entry"])
-            cost=calc_round_trip_cost(entry_p,exit_p,shares)
+            cost=calc_round_trip_cost(entry_p,exit_p,shares,auto_state.get("fee_discount",FEE_DISCOUNT))
             gross=(fill_p-pos["entry"])*shares*(1 if pos["dir"]=="L" else -1)
             net_pnl=gross-cost["total_cost"]
             settlement_date=None
@@ -699,7 +703,8 @@ def force_close_all():
             cost=calc_round_trip_cost(
                 pos["entry"] if pos["dir"]=="L" else fill_p,
                 fill_p if pos["dir"]=="L" else pos["entry"],
-                shares
+                shares,
+                auto_state.get("fee_discount",FEE_DISCOUNT)
             )["total_cost"]
             net_pnl=gross-cost
             settlement_date=None
@@ -1132,6 +1137,23 @@ async def update_watchlist(watchlist:List[str]):
 class PaperCapitalRequest(BaseModel):
     amount:float
 
+class FeeDiscountRequest(BaseModel):
+    discount:float  # 0~1之間，例如6折就填0.6，1折填0.1，無折扣填1.0
+
+@app.put("/auto/fee-discount")
+async def set_fee_discount(req:FeeDiscountRequest):
+    """設定使用者實際從永豐拿到的手續費折扣，取代config.py裡6折的通用假設。
+    這個數字會直接影響所有損益試算(含已經模擬中的舊持倉，下次平倉時就會用新數字算)跟
+    「至少要漲跌多少%才划算」的門檻——折扣設得不準，整套損益估算都會系統性偏差，
+    模擬驗證的可信度也會打折扣。"""
+    if not (0<req.discount<=1):
+        raise HTTPException(status_code=400,detail="折扣必須在0~1之間(例如6折填0.6)")
+    auto_state["fee_discount"]=req.discount
+    _persist_auto_state()
+    _log(f"手續費折扣已設定為{req.discount*10:.1f}折")
+    return {"success":True,"fee_discount":auto_state["fee_discount"],
+            "min_profitable_move_pct":round(min_profitable_move_pct(req.discount),3)}
+
 @app.put("/auto/paper-capital")
 async def set_paper_capital(req:PaperCapitalRequest):
     """設定模擬資金總額。這個資金完全獨立於真實永豐帳戶，模擬模式的部位大小用這個算，
@@ -1151,7 +1173,7 @@ async def set_paper_capital(req:PaperCapitalRequest):
 # ── 交易成本試算（含手續費+當沖證交稅）──────────────────────────────
 @app.get("/fees/calc")
 async def calc_fees(entry_price:float,exit_price:float,qty:int=1000):
-    return calc_round_trip_cost(entry_price,exit_price,qty)
+    return calc_round_trip_cost(entry_price,exit_price,qty,auto_state.get("fee_discount",FEE_DISCOUNT))
 
 @app.get("/contract/{symbol}")
 async def get_contract_eligibility(symbol:str):
@@ -1164,7 +1186,8 @@ async def get_contract_eligibility(symbol:str):
 
 @app.get("/fees/min-move")
 async def get_min_move():
-    return {"min_profitable_move_pct":round(min_profitable_move_pct(),3),
+    return {"min_profitable_move_pct":round(min_profitable_move_pct(auto_state.get("fee_discount",FEE_DISCOUNT)),3),
+            "fee_discount":auto_state.get("fee_discount",FEE_DISCOUNT),
             "note":"當沖一買一賣的價格漲跌幅至少要超過此百分比，才能扣除手續費與證交稅後真正獲利"}
 
 # ── 三大法人買賣超（真實公開資料）─────────────────────────────────────
