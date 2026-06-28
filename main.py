@@ -82,7 +82,7 @@ _auto_state_defaults = {
     # 每日交易漏斗：記錄每個候選股票在每一關被擋下的原因次數，每天重置(_reset_daily)。
     # 直接回答「今天為什麼沒有交易」，不用再去猜log文字背後的原因。
     "funnel":{"scanned":0,"bad_time":0,"no_trade_zone":0,"not_eligible":0,"limit_down_risk":0,
-              "vwap_reject":0,"wide_spread":0,"no_model":0,"low_confidence":0,"sector_dup":0,"unaffordable":0,
+              "vwap_reject":0,"wide_spread":0,"extreme_recent_move":0,"no_model":0,"low_confidence":0,"sector_dup":0,"unaffordable":0,
               "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0,"order_failed":0},
     "ofi_failed_symbols":[],  # OFI訂閱失敗的股票代號清單，點log時顯示具體是哪幾檔
     "capital_info":None,  # 最近一次資金同步的完整明細(balance/available/pending_settlement/available_after_settlement)
@@ -188,6 +188,48 @@ def watchdog_check():
             _watchdog_state["alerted"]=True
     else:
         _watchdog_state["alerted"]=False
+
+
+POSITION_RECONCILE_GRACE_PERIOD_SECONDS = 90  # 開倉後至少等90秒才核對，給永豐端的持倉回報一點緩衝時間，避免單純的回報延遲被誤判成沒成交
+
+def reconcile_real_positions():
+    """真實模式下的第二道防線：_place_real_order()只能確認委託『沒有被立即拒絕』，沒辦法確認
+    委託後來是不是真的成交(可能送出後才被取消/部分成交/其他原因失敗)。這裡定期拿永豐回報的
+    『真實』持倉，跟系統自己以為持有的清單核對，抓出帳本跟真實帳戶脫鉤的情況。
+    完整的做法應該是註冊on_order callback或對每筆委託呼叫update_status()盯著後續狀態變化，
+    這裡先用『定期跟真實持倉核對』這種更簡單、不依賴追蹤個別委託ID的方式頂著——
+    抓不到「為什麼」不一致，但至少能抓到「有沒有」不一致。
+    重要：確認是幻影持倉後直接從追蹤清單移除，不是放著不管——如果留著，正常出場邏輯之後會
+    嘗試賣出根本不存在的持倉，而賣出委託失敗會被_place_real_order的另一個防線擋下、留在清單裡
+    等下次重試，等於陷入永遠賣不掉一筆根本不存在的股票的無限重試迴圈。"""
+    if auto_state.get("paper_mode") or not sinopac_api or not auto_state["positions"]:
+        return
+    try:
+        try: real_positions=sinopac_api.list_positions(stock_account,unit=sj.constant.Unit.Share)
+        except AttributeError:
+            try: real_positions=sinopac_api.list_positions(stock_account)
+            except: real_positions=sinopac_api.list_positions()
+    except Exception as e:
+        logger.warning(f"持倉核對：抓取真實持倉失敗，跳過這次核對: {e}")
+        return
+    real_shares={}
+    for p in (real_positions or []):
+        try:
+            code=getattr(p,"code",None) or getattr(p,"symbol","")
+            real_shares[code]=real_shares.get(code,0)+int(getattr(p,"quantity",0))
+        except Exception:
+            continue
+    now=time.time()
+    suspect=[pos for pos in auto_state["positions"]
+             if now-pos.get("opened_at",now)>=POSITION_RECONCILE_GRACE_PERIOD_SECONDS
+             and real_shares.get(pos["sym"],0)<pos["qty"]*1000]
+    if suspect:
+        for pos in suspect:
+            _log(f"[持倉核對異常]系統記錄持有{pos['qty']}張，但永豐真實持倉查不到對應數量，"
+                 f"這筆委託可能後來沒有真的成交，已從追蹤清單移除，請自行確認永豐帳戶實際狀況",pos["sym"])
+        auto_state["positions"]=[p for p in auto_state["positions"] if p not in suspect]
+        fn=auto_state["funnel"]; fn["order_failed"]=fn.get("order_failed",0)+len(suspect)
+        _persist_auto_state()
 
 
 _last_cum_volume: Dict[str,int] = {}  # 修正：追蹤每檔股票上次輪詢時的累計成交量，用來換算成「這次輪詢期間」的增量
@@ -370,7 +412,7 @@ def _reset_daily():
             "daily_win":0,"daily_trades":0,"consec_loss":0,"pause_until":0,
             "_loss_stop_logged":False,"_profit_lock_logged":False,"_afford_warn_logged":False,"_zero_capital_logged":False,"trade_history":[],
             "funnel":{"scanned":0,"bad_time":0,"no_trade_zone":0,"not_eligible":0,"limit_down_risk":0,
-                      "vwap_reject":0,"wide_spread":0,"no_model":0,"low_confidence":0,"sector_dup":0,"unaffordable":0,
+                      "vwap_reject":0,"wide_spread":0,"extreme_recent_move":0,"no_model":0,"low_confidence":0,"sector_dup":0,"unaffordable":0,
                       "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0,"order_failed":0}})
         _prune_settled_paper_pending()
         _log("每日計數器重置 ✓")
@@ -571,6 +613,19 @@ def auto_trade_tick():
             cinfo=get_contract_info(sym)
             p_now=hist[-1]["price"]
             if cinfo["limit_down"]>0 and p_now<=cinfo["limit_down"]*1.005: fn["limit_down_risk"]+=1; continue  # 接近跌停，做多賣不掉風險高
+            # 瞬間價格穩定機制(集合競價鎖死)風險的保守代理指標：台股規定若成交價超過前5分鐘滾動
+            # 加權均價±3.5%，會強制進入2分鐘集合競價(暫緩撮合)。這裡沒有逐筆資料能驗證精確複製
+            # 交易所的加權均價公式對不對，寧可保守一點不假裝精確——改用「最近5分鐘漲跌幅度」當代理：
+            # 已經在這麼短時間內動這麼大，不管有沒有真的觸發這個機制，追上去都不是好時機(可能買進後
+            # 剛好鎖住2分鐘沒辦法成交，停損停利也一起卡住，沒有任何即時保護)。
+            target_ts=hist[-1]["t"]-300  # 5分鐘前的目標時間點
+            ref_entry=min(hist,key=lambda h:abs(h["t"]-target_ts))
+            # 安全閥：只有真的找到「接近5分鐘前」的資料點才比對，避免今天剛開盤、5分鐘的歷史
+            # 還不存在時，誤抓到昨天收盤價當參考點，把正常的隔夜跳空誤判成「短時間內暴漲暴跌」
+            if abs(ref_entry["t"]-target_ts)<=60 and ref_entry["price"]>0:
+                recent_move_pct=abs(p_now-ref_entry["price"])/ref_entry["price"]*100
+                if recent_move_pct>=3.0:
+                    fn["extreme_recent_move"]=fn.get("extreme_recent_move",0)+1; continue
             # 還是要算advanced_score：①VWAP硬否決規格明確要求保留 ②regime/orb/volume_quality等輸出
             # 現在角色變成「餵給LightGBM的特徵」+「事後顯示用的輔助資訊」，不再是獨立的進場門檻
             adv=advanced_score(sym,prices_h,vols_h,dir_)
@@ -887,6 +942,7 @@ def _refresh_capital_from_account():
 scheduler=BackgroundScheduler(timezone='Asia/Taipei')
 scheduler.add_job(auto_trade_tick,    'interval',seconds=30,id='tick',replace_existing=True)
 scheduler.add_job(watchdog_check,     'interval',seconds=30,id='watchdog',replace_existing=True)
+scheduler.add_job(reconcile_real_positions,'interval',seconds=120,id='reconcile',replace_existing=True) # 真實模式持倉核對，每2分鐘一次(安全網而非主要機制，不需要跟30秒tick一樣頻繁)
 scheduler.add_job(_periodic_persist,  'interval',seconds=60,id='persist',replace_existing=True) # 每分鐘把auto_state存進資料庫
 scheduler.add_job(scan_top_stocks,    'interval',minutes=5,id='scan',replace_existing=True) # 每5分鐘掃描全市場股票池
 scheduler.add_job(_refresh_capital_from_account, 'interval',minutes=5,id='capital_refresh',replace_existing=True) # 確保後端自己定期跟永豐核對真實可用資金，不依賴前端
@@ -907,12 +963,6 @@ app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_
 class ConnectRequest(BaseModel):
     api_key:str; secret_key:str
     ca_path:str=""; ca_password:str=""; person_id:str=""
-
-class OrderRequest(BaseModel):
-    symbol:str; direction:str; quantity:int; price:float; order_type:str="市價"
-
-class CancelRequest(BaseModel):
-    order_id:str
 
 class AutoStartRequest(BaseModel):
     risk:str="low"; cap_pct:int=100; watchlist:List[str]=[]
@@ -1174,11 +1224,6 @@ async def set_paper_capital(req:PaperCapitalRequest):
     _log(f"模擬資金已調整為NT${req.amount:,.0f}")
     return {"success":True,"paper_capital":auto_state["paper_capital"]}
 
-# ── 交易成本試算（含手續費+當沖證交稅）──────────────────────────────
-@app.get("/fees/calc")
-async def calc_fees(entry_price:float,exit_price:float,qty:int=1000):
-    return calc_round_trip_cost(entry_price,exit_price,qty,auto_state.get("fee_discount",FEE_DISCOUNT))
-
 @app.get("/contract/{symbol}")
 async def get_contract_eligibility(symbol:str):
     """查詢個股當沖資格與漲跌停價（真實永豐合約資料），供前端下單前提示風險"""
@@ -1206,16 +1251,6 @@ async def get_institutional_flows(top:int=10):
     top_buy  = [{"symbol":k,**v} for k,v in sorted_items[:top] if v["total"]>0]
     top_sell = [{"symbol":k,**v} for k,v in sorted_items[::-1][:top] if v["total"]<0]
     return {"date":institutional_cache["date"],"top_buy":top_buy,"top_sell":top_sell}
-
-@app.get("/institutional/flows/{symbol}")
-async def get_institutional_flow_for_symbol(symbol:str):
-    """查詢特定股票的三大法人買賣超"""
-    update_institutional_cache()
-    symbol = symbol.replace(".TW","").replace(".TWO","")
-    data = institutional_cache["data"].get(symbol)
-    if not data:
-        return {"symbol":symbol,"found":False,"date":institutional_cache["date"]}
-    return {"symbol":symbol,"found":True,"date":institutional_cache["date"],**data}
 
 @app.get("/scan/topstocks")
 async def get_scan_results(top:int=5, background_tasks:BackgroundTasks=None):
@@ -1290,67 +1325,6 @@ async def get_positions():
         logger.error(f"list_positions 失敗: {e}")
         raise HTTPException(status_code=500,detail=f"持倉查詢失敗: {str(e)}")
 
-# ── 委託記錄 ──────────────────────────────────────────────────────
-@app.get("/orders")
-async def get_orders():
-    if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
-    try:
-        sinopac_api.update_status(stock_account)
-        trades=sinopac_api.list_trades()
-        return [{"order_id":t.order.id,"symbol":t.contract.code,
-                 "action":str(t.order.action),"quantity":int(t.order.quantity),
-                 "price":float(t.order.price),"status":str(t.status.status),
-                 "time":str(t.status.order_datetime)} for t in trades]
-    except Exception as e:
-        raise HTTPException(status_code=500,detail=str(e))
-
-# ── 下單 ──────────────────────────────────────────────────────────
-@app.post("/order")
-async def place_order(req:OrderRequest):
-    if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
-    try:
-        contract=sinopac_api.Contracts.Stocks.get(req.symbol)
-        if not contract: raise HTTPException(status_code=404,detail=f"找不到股票 {req.symbol}")
-        action=sj.constant.Action.Buy if req.direction in ["做多","買進","buy"] else sj.constant.Action.Sell
-        # 真實當沖資格檢查（依永豐合約資料的 day_trade 欄位，Yes/No/OnlyBuy）
-        # 法規規定：零股、權證、ETN、處置股票皆不可當沖，僅整張可當沖（已用張為下單單位確保此規則）
-        day_trade_status = str(getattr(contract,"day_trade",""))
-        if "No" in day_trade_status:
-            raise HTTPException(status_code=400,detail=f"{req.symbol} 今日不可當沖（可能為處置股票或不符當沖資格），已阻止下單")
-        if "OnlyBuy" in day_trade_status and action==sj.constant.Action.Sell:
-            raise HTTPException(status_code=400,detail=f"{req.symbol} 今日僅限先買後賣（OnlyBuy），不可先賣後買，已阻止下單")
-        # 漲跌停鎖死風險檢查：若是做空（賣出）時遇漲停鎖死最危險（買不回會有違約交割+借券費風險）
-        limit_up=float(getattr(contract,"limit_up",0) or 0)
-        limit_down=float(getattr(contract,"limit_down",0) or 0)
-        if limit_up>0 and req.price>=limit_up*0.998:
-            logger.warning(f"{req.symbol} 接近漲停價({limit_up})，若為做空回補方向可能無法成交，請留意")
-        if limit_down>0 and req.price<=limit_down*1.002:
-            logger.warning(f"{req.symbol} 接近跌停價({limit_down})，若為做多賣出方向可能無法成交")
-        ptype=sj.constant.StockPriceType.MKT if req.order_type=="市價" else sj.constant.StockPriceType.LMT
-        order=sinopac_api.Order(price=req.price,quantity=req.quantity,action=action,
-            price_type=ptype,order_type=sj.constant.OrderType.ROD,account=stock_account)
-        trade=sinopac_api.place_order(contract,order)
-        return {"success":True,"order_id":trade.order.id,"status":str(trade.status.status),
-                "symbol":req.symbol,"direction":req.direction,"quantity":req.quantity,"price":req.price}
-    except HTTPException: raise
-    except Exception as e:
-        raise HTTPException(status_code=500,detail=f"下單失敗：{str(e)}")
-
-# ── 取消委託 ──────────────────────────────────────────────────────
-@app.post("/cancel")
-async def cancel_order(req:CancelRequest):
-    if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
-    try:
-        sinopac_api.update_status(stock_account)
-        trades=sinopac_api.list_trades()
-        target=next((t for t in trades if t.order.id==req.order_id),None)
-        if not target: raise HTTPException(status_code=404,detail="找不到此委託單")
-        sinopac_api.cancel_order(target)
-        return {"success":True,"order_id":req.order_id}
-    except HTTPException: raise
-    except Exception as e:
-        raise HTTPException(status_code=500,detail=str(e))
-
 # ── 即時股價 ──────────────────────────────────────────────────────
 @app.get("/price/{symbol}")
 async def get_price(symbol:str):
@@ -1424,22 +1398,3 @@ async def get_history(symbol:str, bars:int=90):
     if not agg:
         return {"symbol":symbol,"bars":[],"note":"無歷史資料（可能非交易日或新股）"}
     return {"symbol":symbol,"bars":agg,"source":"real_kbars"}
-
-@app.get("/settlements")
-async def get_settlements():
-    if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
-    try:
-        data=sinopac_api.settlements(stock_account)
-        return [{"date":str(s.date),"amount":float(s.amount),"t_date":str(getattr(s,"t_date",""))} for s in data]
-    except Exception as e:
-        raise HTTPException(status_code=500,detail=str(e))
-
-# ── 完整投資組合 ──────────────────────────────────────────────────
-@app.get("/portfolio")
-async def get_portfolio():
-    if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
-    acc=await get_account()
-    pos=await get_positions()
-    ords=await get_orders()
-    setts=await get_settlements()
-    return {"account":acc,"positions":pos,"orders":ords,"settlements":setts}
