@@ -411,13 +411,18 @@ def subscribe_ofi_symbols(symbols, api, auto_state) -> int:
     逐檔try/except，一檔失敗不影響其他檔，回傳成功訂閱數量——
     如果這個數字遠小於預期，代表可能撞到訂閱數上限(46檔*2=92個訂閱不算少)，要去看log warning。
     修正：原本失敗只寫進log warning，使用者想知道「具體是哪幾檔」得去翻後端log——
-    現在額外記錄進auto_state["ofi_failed_symbols"]，前端點log那一行就能直接看到清單。"""
+    現在額外記錄進auto_state["ofi_failed_symbols"]，前端點log那一行就能直接看到清單。
+    修正②：原本「已經訂閱過，跳過」跟「真的失敗」沒有分開記錄——如果這次呼叫的symbols全部都已經
+    訂閱過(例如/connect被意外呼叫兩次，常見原因是網路狀態不穩導致前端重送請求)，回傳的ok_count
+    會是0，但這不是「訂閱失敗」，是「沒有新的要訂閱」，呼叫端的log訊息要能正確分辨這兩種情況，
+    不然使用者會看到嚇人的「0/49檔成功」，以為真的出了問題，去翻log warning卻什麼都找不到。"""
     import shioaji as sj
     if not api: return 0
     ok_count=0
+    already_count=0
     failed=[]
     for sym in symbols:
-        if sym in _ofi_subscribed: continue
+        if sym in _ofi_subscribed: already_count+=1; continue
         try:
             contract=api.Contracts.Stocks.get(sym)
             if not contract: failed.append(sym); continue
@@ -430,6 +435,7 @@ def subscribe_ofi_symbols(symbols, api, auto_state) -> int:
             logger.warning(f"OFI訂閱{sym}失敗(可能撞到訂閱數上限): {e}")
     if failed:
         auto_state["ofi_failed_symbols"]=failed
+    auto_state["ofi_already_subscribed_count"]=already_count
     return ok_count
 
 def unsubscribe_ofi_symbols(symbols, api):

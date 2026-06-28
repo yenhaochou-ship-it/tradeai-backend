@@ -1109,7 +1109,16 @@ async def connect(req:ConnectRequest, background_tasks:BackgroundTasks):
         ofi_symbols=list(set(auto_state["watchlist"]) | set(SCAN_UNIVERSE))
         def _do_ofi_subscribe():
             n_ok=subscribe_ofi_symbols(ofi_symbols, api, auto_state)
-            _log(f"OFI即時訂閱完成：{n_ok}/{len(ofi_symbols)}檔成功"+("" if n_ok==len(ofi_symbols) else "（有股票訂閱失敗，那些股票的order_flow特徵會用0中性值代替，看log warning找原因）"))
+            already=auto_state.get("ofi_already_subscribed_count",0)
+            n_failed=len(ofi_symbols)-n_ok-already
+            if n_failed<=0:
+                # 修正：原本只看n_ok!=總數就說「有股票訂閱失敗」，但如果這次呼叫的股票早就被
+                # 之前一次呼叫訂閱過(例如/connect短時間內被呼叫兩次)，n_ok會是0，卻不是真的失敗，
+                # 是「沒有新的要訂閱」——要扣掉already_count才知道是不是真的有股票訂閱不到。
+                msg=f"OFI即時訂閱完成：{n_ok+already}/{len(ofi_symbols)}檔涵蓋"+(f"(其中{already}檔先前已訂閱過)" if already>0 else "")
+            else:
+                msg=f"OFI即時訂閱完成：{n_ok+already}/{len(ofi_symbols)}檔涵蓋，{n_failed}檔訂閱失敗，那些股票的order_flow特徵會用0中性值代替，看log warning找原因"
+            _log(msg)
         background_tasks.add_task(_do_ofi_subscribe)
         return {"success":True,"stock_account":str(stock_account) if stock_account else None,
                 "future_account":str(future_account) if future_account else None,
