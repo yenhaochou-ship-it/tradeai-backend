@@ -40,7 +40,7 @@ from state import price_cache
 from signals import (
     calc_signal_py, is_no_trade_zone, advanced_score,
     MARKET_INDEX_SYMBOL, get_market_context,
-    subscribe_ofi_symbols, unsubscribe_all_ofi, get_latest_spread_pct,
+    subscribe_ofi_symbols, unsubscribe_all_ofi, unsubscribe_ofi_symbols, get_latest_spread_pct,
     _on_tick_stk_v1, _on_bidask_stk_v1, _flush_all_ofi,
 )
 from ml_model import (
@@ -283,17 +283,45 @@ def _snapshot(sym:str) -> Optional[Dict]:
         if not c: return None
         s=sinopac_api.snapshots([c])
         if not s: return None
-        snap=s[0]
-        tt=getattr(snap,"tick_type",None)
-        tt_val = (1 if str(tt).endswith("Buy") else 2 if str(tt).endswith("Sell") else 0) if tt is not None else 0
-        return {
-            "price":float(snap.close),
-            "volume":int(getattr(snap,"total_volume",0) or 0),
-            "buy_vol":float(getattr(snap,"buy_volume",0) or 0),
-            "sell_vol":float(getattr(snap,"sell_volume",0) or 0),
-            "tick_type":tt_val,  # 1=外盤(買進成交) 2=內盤(賣出成交) 0=無法判定
-        }
+        return _parse_snapshot(s[0])
     except: return None
+
+def _parse_snapshot(snap) -> Dict:
+    tt=getattr(snap,"tick_type",None)
+    tt_val = (1 if str(tt).endswith("Buy") else 2 if str(tt).endswith("Sell") else 0) if tt is not None else 0
+    return {
+        "price":float(snap.close),
+        "volume":int(getattr(snap,"total_volume",0) or 0),
+        "buy_vol":float(getattr(snap,"buy_volume",0) or 0),
+        "sell_vol":float(getattr(snap,"sell_volume",0) or 0),
+        "tick_type":tt_val,  # 1=外盤(買進成交) 2=內盤(賣出成交) 0=無法判定
+    }
+
+def _snapshot_batch(syms) -> Dict[str,Dict]:
+    """一次幫一批股票打一個snapshots() API，而不是每檔股票各打一次——Shioaji原生支援
+    傳入一個contracts list、一次回傳全部結果(用.code欄位對應回是哪一檔，不依賴順序)，
+    47檔股票原本要47次來回，現在1次打完。回傳{symbol: 解析後的dict}，抓不到/解析失敗的symbol不會出現在結果裡，
+    呼叫端要用.get(sym)處理缺漏，跟原本_snapshot()回傳None時的處理方式一致。"""
+    if not sinopac_api or not syms: return {}
+    out={}
+    try:
+        contracts=[]; sym_by_code={}
+        for sym in syms:
+            c=sinopac_api.Contracts.Stocks.get(sym)
+            if c:
+                contracts.append(c)
+                sym_by_code[getattr(c,"code",sym)]=sym
+        if not contracts: return {}
+        snaps=sinopac_api.snapshots(contracts)
+        for snap in (snaps or []):
+            code=getattr(snap,"code",None)
+            sym=sym_by_code.get(code)
+            if sym is None: continue
+            try: out[sym]=_parse_snapshot(snap)
+            except: continue
+    except Exception as e:
+        logger.warning(f"批次抓取快照失敗，這個tick的價格更新會跳過: {e}")
+    return out
 
 def _update_cache():
     # 模擬下單模式：除了使用者自選清單，也持續更新40檔股票池的價格快取，
@@ -305,8 +333,12 @@ def _update_cache():
     # 跟OFI訂閱一樣是核心基礎設施，不該因為使用者改了自選股清單就斷掉——這支不會被當成交易標的
     # (是否可交易仍然只看candidates_pool，跟這裡的價格追蹤是分開的兩件事)。
     symbols.add(MARKET_INDEX_SYMBOL)
+    # 修正：原本每檔股票各自呼叫一次_snapshot()單獨打API，paper_mode下symbols可能高達47檔，
+    # 等於每30秒的tick都要做47次序列化的網路來回——改成一次批次打完，大幅減少tick的延遲跟
+    # 對Shioaji行情API的呼叫次數(雖然5秒500次的額度本來就夠用，但能省則省，也降低單檔逾時拖累整批的風險)。
+    snaps=_snapshot_batch(symbols)
     for sym in symbols:
-        snap=_snapshot(sym)
+        snap=snaps.get(sym)
         if snap:
             cum_vol=snap["volume"]  # snapshot的volume其實是「今天累計成交量」(total_volume)，不是這次輪詢期間的量
             prev_cum=_last_cum_volume.get(sym)
@@ -395,7 +427,13 @@ def auto_trade_tick():
     to_close=[]
     for pos in auto_state["positions"]:
       try:
-        sym=pos["sym"]; snap=_snapshot(sym)
+        sym=pos["sym"]
+        # 修正：這裡原本每筆持倉都重新呼叫一次_snapshot(sym)單獨打API，但同一個tick裡
+        # _update_cache()早幾行就已經幫所有自選股/股票池(持倉幾乎一定包含在內)抓過一次新鮮報價了，
+        # 等於同一個symbol在同一個30秒週期內打兩次一樣的API——改成直接讀price_cache最新一筆，
+        # 完全不犧牲新鮮度(中間只隔幾行純運算，沒有任何I/O)，省掉重複的網路來回。
+        cached=price_cache.get(sym)
+        snap=({"price":cached[-1]["price"]} if cached else None) or _snapshot(sym)
         if not snap: continue
         p=snap["price"]
         pp=(p-pos["entry"])/pos["entry"]*100*(1 if pos["dir"]=="L" else -1)
@@ -1077,11 +1115,18 @@ async def export_feature_log():
 
 @app.put("/auto/watchlist")
 async def update_watchlist(watchlist:List[str]):
+    old_watchlist=set(auto_state.get("watchlist",[]))
+    removed=old_watchlist-set(watchlist)
     auto_state["watchlist"]=watchlist
     _persist_auto_state()
     if sinopac_api:  # 模組一：自選股新增的股票也要補訂閱OFI，不然extract_ml_features對它們永遠拿不到即時OFI
         n_ok=subscribe_ofi_symbols(watchlist, sinopac_api, auto_state)
         if n_ok>0: _log(f"自選股更新，補訂閱OFI {n_ok}檔")
+        if removed:
+            # 修正：被移除的自選股，OFI訂閱原本會一直留著(只有整個斷線才清)，長期下來訂閱數
+            # 會跟「目前」自選股清單大小脫鉤、一路往上累積，最終可能不明原因撞到訂閱數上限。
+            unsubscribe_ofi_symbols(removed, sinopac_api)
+            _log(f"自選股更新，取消訂閱已移除的{len(removed)}檔OFI")
     return {"success":True,"watchlist":watchlist}
 
 class PaperCapitalRequest(BaseModel):

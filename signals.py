@@ -432,6 +432,25 @@ def subscribe_ofi_symbols(symbols, api, auto_state) -> int:
         auto_state["ofi_failed_symbols"]=failed
     return ok_count
 
+def unsubscribe_ofi_symbols(symbols, api):
+    """取消訂閱「指定的這幾檔」，跟unsubscribe_all_ofi(取消全部)不一樣——用在自選股被移除時，
+    只清掉被移除那幾檔的訂閱，不影響還留著的其他股票。修正：原本watchlist更新只會幫新增的股票
+    補訂閱，被移除的股票訂閱會一直留著(只有整個斷線登出才會清)，使用者如果常常換自選股，
+    訂閱數會隨時間一路往上累積，最終可能撞到Shioaji的訂閱數上限，而且原因跟「目前」自選股
+    清單大小完全無關，難以察覺。"""
+    if not api or not symbols: return
+    import shioaji as sj
+    for sym in symbols:
+        if sym not in _ofi_subscribed: continue
+        try:
+            contract=api.Contracts.Stocks.get(sym)
+            if contract:
+                api.quote.unsubscribe(contract,quote_type=sj.constant.QuoteType.Tick,version=sj.constant.QuoteVersion.v1)
+                api.quote.unsubscribe(contract,quote_type=sj.constant.QuoteType.BidAsk,version=sj.constant.QuoteVersion.v1)
+            _ofi_subscribed.discard(sym)
+        except Exception as e:
+            logger.warning(f"OFI取消訂閱{sym}失敗: {e}")
+
 def unsubscribe_all_ofi(api):
     if not api: return
     import shioaji as sj
