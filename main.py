@@ -79,6 +79,10 @@ _auto_state_defaults = {
     # 模擬驗證進度：累積筆數/交易日不會被每日重置清空（跟trade_history不一樣），
     # 做為「切換成真實下單」前的最低驗證門檻依據，見 PAPER_VALIDATION_MIN_*。
     "paper_validation":{"trade_count":0,"trading_days":[]},
+    # 權益曲線：每個交易日收盤後記錄一筆{date, equity, mode}，這是算最大回撤跟年化報酬率的唯一資料來源——
+    # 原本只累積總贏/總輸金額跟勝負次數，沒有「隨時間變化的帳戶總值」這個時間序列，根本算不出
+    # 最大回撤(需要知道帳戶價值從哪個高點跌到哪個低點)，年化報酬率也只能用不夠嚴謹的線性外推。
+    "equity_curve":[],  # [{"date":"YYYY-MM-DD","equity":float,"mode":"paper"|"real"}, ...]
     # 每日交易漏斗：記錄每個候選股票在每一關被擋下的原因次數，每天重置(_reset_daily)。
     # 直接回答「今天為什麼沒有交易」，不用再去猜log文字背後的原因。
     "funnel":{"scanned":0,"bad_time":0,"no_trade_zone":0,"not_eligible":0,"limit_down_risk":0,
@@ -161,6 +165,52 @@ def _paper_validation_progress() -> dict:
             "win_rate":win_rate,"profit_factor":profit_factor,
             "avg_win_pct":avg_win_pct,"avg_loss_pct":avg_loss_pct,
             "total_pnl":round(total_win+total_loss,0)}
+
+ANNUALIZED_RELIABLE_MIN_DAYS = 20  # 少於這個交易日數，年化外推會被單一極端的好/壞日子放大到失真，不該被當真
+
+def compute_performance_metrics() -> dict:
+    """從equity_curve(每個交易日收盤後記錄的帳戶總值)算出最大回撤、年化報酬率這些標準績效指標。
+    重要：年化報酬率是用複利公式把『目前累積的報酬率』外推成『一年的話會是多少』，這個外推方式
+    在交易日數還很少的時候統計上極不可靠——比如只跑了3天，其中1天剛好大賺3%，外推成年化可能
+    變成一個荒謬的三位數百分比，那不是「這個策略真的能賺那麼多」，是「樣本太少，被單一個事件
+    放大到失真」。這裡明確標記is_annualized_reliable跟附上原因，畫面顯示時應該照這個標記決定
+    要不要用警示色或加註說明，不能直接秀一個算出來的數字就讓人誤以為這是可信的預期報酬率。"""
+    curve=auto_state.get("equity_curve",[])
+    if len(curve)<2:
+        return {"available":False,"reason":"權益曲線資料不足(至少需要2個交易日才能算出任何報酬率)",
+                "trading_days":len(curve)}
+    equities=[c["equity"] for c in curve]
+    start_equity=equities[0]; end_equity=equities[-1]
+    n_days=len(curve)
+    if start_equity<=0:
+        return {"available":False,"reason":"起始權益為0或負數，無法計算報酬率","trading_days":n_days}
+    total_return_pct=(end_equity/start_equity-1)*100
+    try:
+        annualized_return_pct=((end_equity/start_equity)**(252/n_days)-1)*100
+    except (OverflowError,ZeroDivisionError):
+        annualized_return_pct=None
+    # 最大回撤：從權益曲線逐筆掃過去，追蹤「目前為止的歷史新高」，每個點都跟這個新高比，
+    # 記錄過程中出現過的最大跌幅(不是只看頭尾兩點，要看過程中真正最深的那一次)
+    peak=equities[0]; peak_date=curve[0]["date"]
+    max_dd=0.0; worst_peak_date=peak_date; worst_trough_date=peak_date
+    for c in curve:
+        e=c["equity"]
+        if e>peak: peak=e; peak_date=c["date"]
+        dd=(peak-e)/peak*100 if peak>0 else 0.0
+        if dd>max_dd: max_dd=dd; worst_peak_date=peak_date; worst_trough_date=c["date"]
+    is_reliable=n_days>=ANNUALIZED_RELIABLE_MIN_DAYS
+    return {
+        "available":True,"trading_days":n_days,
+        "start_equity":round(start_equity,2),"end_equity":round(end_equity,2),
+        "total_return_pct":round(total_return_pct,3),
+        "annualized_return_pct":round(annualized_return_pct,2) if annualized_return_pct is not None else None,
+        "max_drawdown_pct":round(max_dd,3),
+        "max_drawdown_peak_date":worst_peak_date,"max_drawdown_trough_date":worst_trough_date,
+        "is_annualized_reliable":is_reliable,
+        "reliability_note":None if is_reliable else
+            f"只有{n_days}個交易日的資料，年化報酬率用複利外推會被單一好/壞日子放大到失真，"
+            f"建議累積到至少{ANNUALIZED_RELIABLE_MIN_DAYS}個交易日後才認真參考這個數字",
+    }
 
 # ══════════════════════════════════════════════════════════════════
 # 看門狗：Shioaji官方自己的參考交易終端機文件寫得很清楚——
@@ -858,6 +908,17 @@ def post_market_summary():
     pf_str="∞" if pf==float("inf") else f"{pf:.2f}"
     _log(f"盤後總結 | P&L:${auto_state['daily_pnl']:.0f} | 勝率:{wr:.0f}%({auto_state['daily_win']}/{auto_state['daily_trades']}) "
          f"| 獲利因子:{pf_str}(>1.5算及格) | 平均贏{avg_win:+.2f}% 平均輸{avg_loss:+.2f}%")
+    # 記錄今天收盤的權益曲線快照——不管今天有沒有交易都記，缺一天權益曲線就斷掉一截，
+    # 之後算最大回撤/年化報酬率會失準。用全帳本價值(paper_capital/capital)，不是「扣除待交割款
+    # 後的可用金額」，因為權益曲線要反映「帳戶實際總值」，不是「現在能不能馬上動用」這個流動性問題。
+    today_str=tw_now().strftime("%Y-%m-%d")
+    mode="paper" if auto_state.get("paper_mode") else "real"
+    equity=auto_state.get("paper_capital",0.0) if mode=="paper" else auto_state.get("capital",0.0)
+    curve=auto_state.setdefault("equity_curve",[])
+    if not curve or curve[-1].get("date")!=today_str:
+        curve.append({"date":today_str,"equity":round(equity,2),"mode":mode})
+        auto_state["equity_curve"]=curve[-365:]  # 留最近365筆，避免無限增長(一年的交易日數綽綽有餘)
+        _persist_auto_state()
 
 def ml_training_window():
     _log("21:00 ML訓練時段開始（前端訓練請在學習分頁執行）")
@@ -1214,6 +1275,7 @@ async def auto_status():
             "paper_validation_min_trades":PAPER_VALIDATION_MIN_TRADES,
             "paper_validation_min_days":PAPER_VALIDATION_MIN_DAYS,
             "paper_validation_progress":_paper_validation_progress(),
+            "performance_metrics":compute_performance_metrics(),
             "lgbm_model":lgbm_status,
             "price_cache_size":{k:len(v) for k,v in price_cache.items()},
             "watchdog":{"seconds_since_tick":round(time.time()-_watchdog_state["last_tick_at"],1),
@@ -1223,6 +1285,11 @@ async def auto_status():
 async def get_paper_validation():
     """真實下單前的模擬驗證進度，供前端顯示「還差幾筆/幾天」"""
     return _paper_validation_progress()
+
+@app.get("/auto/performance")
+async def get_performance_metrics():
+    """年化報酬率/最大回撤等標準績效指標，從每日收盤後記錄的權益曲線算出來"""
+    return compute_performance_metrics()
 
 @app.get("/auto/feature_log.csv")
 async def export_feature_log():
