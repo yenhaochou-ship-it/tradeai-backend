@@ -373,6 +373,29 @@ def reconcile_real_positions():
         fn=auto_state["funnel"]; fn["order_failed"]=fn.get("order_failed",0)+len(suspect)
         _persist_auto_state()
 
+def _get_real_held_symbols() -> set:
+    """真實模式專用：查詢真實帳戶目前實際持有(不論零股或整股、不論是bot買的還是使用者自己手動買的)
+    的股票代號集合。用在開新倉前排除掉這些股票，避免bot完全不知道使用者帳戶裡已經有這檔的
+    手動持倉(例如零股)，疊加買進整張造成超出預期的集中風險——bot自己的auto_state["positions"]
+    只記錄它自己開的倉，對使用者在同一個真實帳戶裡自行操作的持倉完全沒有概念，這個函式補上這一層。"""
+    if not sinopac_api: return set()
+    try:
+        try: positions=sinopac_api.list_positions(stock_account,unit=sj.constant.Unit.Share)
+        except AttributeError:
+            try: positions=sinopac_api.list_positions(stock_account)
+            except: positions=sinopac_api.list_positions()
+        held=set()
+        for p in (positions or []):
+            try:
+                if int(getattr(p,"quantity",0))>0:
+                    held.add(getattr(p,"code",None) or getattr(p,"symbol",""))
+            except Exception:
+                continue
+        return held
+    except Exception as e:
+        logger.warning(f"查詢真實持倉(用於避免疊加手動持倉)失敗，這次tick會跳過這層保護: {e}")
+        return set()
+
 
 _last_cum_volume: Dict[str,int] = {}  # 修正：追蹤每檔股票上次輪詢時的累計成交量，用來換算成「這次輪詢期間」的增量
 MAX_BARS = 120
@@ -776,6 +799,11 @@ def auto_trade_tick():
         candidates_pool=[]
     else:
         existing={p["sym"] for p in auto_state["positions"]}
+        if not auto_state.get("paper_mode"):
+            # 真實模式：額外排除「真實帳戶裡已經有持倉」的股票，不管是bot自己買的還是使用者自己
+            # 手動操作的(包括零股)——bot自己的清單對使用者手動持倉完全沒有概念，這層保護避免
+            # 在使用者已經手動持有某檔股票時，bot又買進整張疊加上去，造成超出預期的集中風險。
+            existing |= _get_real_held_symbols()
         # 模擬下單：從40檔股票池找機會；真實下單：僅限使用者自選清單（較保守，避免真錢自動擴大選股範圍）
         candidates_pool=list(set(auto_state["watchlist"]) | set(SCAN_UNIVERSE)) if auto_state.get("paper_mode") else list(auto_state["watchlist"])
 
@@ -1113,17 +1141,27 @@ def _refresh_capital_from_account():
         balance=float(getattr(bal,"acc_balance",None) or getattr(bal,"balance",0))
         avail  =float(getattr(bal,"available_balance",None) or getattr(bal,"available",0))
         pending_settlement = 0.0
-        settlement_schedule = []  # [{"date":"YYYY-MM-DD","amount":float}, ...] 哪一天會交割多少錢的明細，不只是加總後的單一數字
+        settlement_schedule = []  # [{"date":"YYYY-MM-DD","amount":float,"type":"payable"|"receivable"}, ...]
         try:
             setts = sinopac_api.settlements(stock_account)
             today_str = tw_now().strftime("%Y-%m-%d")
             for s in setts:
                 t_date = str(getattr(s,"t_date","") or getattr(s,"date",""))
-                amt = abs(float(s.amount))
-                if t_date and t_date >= today_str:
-                    pending_settlement += amt
-                    if amt > 0:
-                        settlement_schedule.append({"date":t_date,"amount":amt})
+                # 修正：原本這裡用abs(s.amount)，把正負號直接抹掉——但用真實對帳單核對過，
+                # 永豐的交割金額本來就有正負號：買進是負數(應付，你欠的錢)，賣出是正數(應收，
+                # 還沒入帳的錢)。原本不分正負一律加總取絕對值，會把「還沒收到的賣出款」也當成
+                # 「要扣的錢」算進pending_settlement，嚴重高估真正該扣掉的金額(實測案例：應付
+                # 66,934加應收35,394，原本錯誤算成102,328要扣，正確應該只扣應付的66,934)。
+                # 應收(賣出)的錢還在T+2交割中、還沒真的到帳，不該拿來『增加』可用資金，但也不該
+                # 被誤當成又一筆要扣的負擔——所以只有應付(買進，負數)才計入pending_settlement，
+                # 應收(賣出，正數)只放進明細給你參考「之後會收到多少」，不影響可用資金的計算。
+                raw_amt = float(s.amount)
+                if t_date and t_date >= today_str and raw_amt != 0:
+                    if raw_amt < 0:
+                        pending_settlement += abs(raw_amt)
+                        settlement_schedule.append({"date":t_date,"amount":abs(raw_amt),"type":"payable"})
+                    else:
+                        settlement_schedule.append({"date":t_date,"amount":raw_amt,"type":"receivable"})
             settlement_schedule.sort(key=lambda x:x["date"])
         except Exception as se:
             logger.warning(f"無法取得交割資料，風控將以可用餘額為準（未扣交割款）: {se}")
@@ -1554,11 +1592,14 @@ async def get_positions():
                 direction_raw=str(getattr(p,"direction","Buy"))
                 is_long="buy" in direction_raw.lower()
                 direction="Buy" if is_long else "Sell"
-                # 修正：getattr(p,"pnl_percent",0)在永豐回傳的真實持倉物件上一直拿不到值，
-                # 每次都是落到預設值0(不是真的算出來是0%，是這個屬性名稱在Shioaji物件上根本不存在，
-                # 螢幕上看到兩筆不同損益的持倉同時顯示+0.00%就是這個落空預設值的症狀)。
-                # 改成直接用均價/現價自己算，不依賴猜測屬性名稱對不對，long/short方向都正確處理。
-                pnlp=((lp-ap)/ap*100 if is_long else (ap-lp)/ap*100) if ap else 0.0
+                # 修正：原本pnl_percent是直接用均價/現價的價差自己算，跟pnl(直接讀Shioaji回傳的金額)
+                # 是兩條獨立算出來的數字——螢幕上會同時看到「-5222」跟「-7.58%」，但600股×(103.10-111.56)
+                # 算出來其實是-5076，不是-5222，代表Shioaji自己的pnl金額包含了價差以外的東西(可能是
+                # 預估手續費/證交稅之類的成本)，跟純粹用價差算的百分比不是同一件事，兩個數字擺在一起
+                # 卻對不起來，看起來像是哪裡算錯了。改成直接拿pnl金額去除以成本反推百分比，保證
+                # 兩個數字永遠互相對得上，不管Shioaji的pnl金額裡實際包含了什麼我們不清楚的調整項目。
+                cost_basis=ap*qty
+                pnlp=(pnl/cost_basis*100) if cost_basis else 0.0
                 result.append({"symbol":code,"name":getattr(p,"name",code),"quantity":qty,
                     "avg_price":ap,"current_price":lp,"pnl":pnl,"pnl_percent":round(pnlp,2),
                     "direction":direction,"value":lp*qty if lp else ap*qty})
