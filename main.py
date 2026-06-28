@@ -83,6 +83,7 @@ _auto_state_defaults = {
     # 原本只累積總贏/總輸金額跟勝負次數，沒有「隨時間變化的帳戶總值」這個時間序列，根本算不出
     # 最大回撤(需要知道帳戶價值從哪個高點跌到哪個低點)，年化報酬率也只能用不夠嚴謹的線性外推。
     "equity_curve":[],  # [{"date":"YYYY-MM-DD","equity":float,"mode":"paper"|"real"}, ...]
+    "drawdown_halt":False,"drawdown_halt_info":None,  # 累積回撤保護觸發狀態，需要手動resume才會解除
     # 每日交易漏斗：記錄每個候選股票在每一關被擋下的原因次數，每天重置(_reset_daily)。
     # 直接回答「今天為什麼沒有交易」，不用再去猜log文字背後的原因。
     "funnel":{"scanned":0,"bad_time":0,"no_trade_zone":0,"not_eligible":0,"limit_down_risk":0,
@@ -114,15 +115,23 @@ RISK_CFG = {
 # (PAPER_VALIDATION_MIN_TRADES/MIN_DAYS/MAX_TRADES_PER_DAY/CONSEC_LOSS_STOP 已從config.py匯入)
 # ══════════════════════════════════════════════════════════════════
 
-def _record_paper_validation(pnl:float=0.0, pct:float=0.0):
+def _record_paper_validation(pnl:float=0.0, pct:float=0.0, held_min:float=0.0):
     """每筆模擬交易平倉後呼叫：累積驗證進度，trade_count/trading_days/累積損益都不會被_reset_daily清空。
     修正：原本只記trade_count/trading_days，沒記損益細節——但trade_history每天會被_reset_daily清空，
     等20筆+5天驗證期跑完時，根本沒有資料可以回頭算「這段期間整體的Profit Factor/勝率」，
-    只能看到「今天」的數字。改成額外累積總贏/總輸金額跟勝負次數，才能算出真正跨天的驗證報告。"""
+    只能看到「今天」的數字。改成額外累積總贏/總輸金額跟勝負次數，才能算出真正跨天的驗證報告。
+    修正②：補上「專業」績效報告通常會有、但這裡原本完全沒追蹤的幾項——單筆最大贏/最大輸、
+    最長連勝/連敗紀錄(歷史最高，不是現在風控用的當前連敗數)、總持倉時間(用來算平均持倉分鐘)。
+    這些數字本身不難算，難的是「資料根本沒被存下來」，trade_history每天被清空，這些統計量
+    必須在這裡(不會被每日重置的地方)逐筆累積，不能事後從trade_history回頭算。"""
     pv=auto_state.setdefault("paper_validation",{"trade_count":0,"trading_days":[],
                               "total_win_pnl":0.0,"total_loss_pnl":0.0,"wins":0,"losses":0,
-                              "win_pct_sum":0.0,"loss_pct_sum":0.0})
+                              "win_pct_sum":0.0,"loss_pct_sum":0.0,
+                              "largest_win_pnl":0.0,"largest_loss_pnl":0.0,
+                              "current_streak":0,"max_win_streak":0,"max_loss_streak":0,
+                              "total_held_min":0.0})
     pv["trade_count"]=pv.get("trade_count",0)+1
+    pv["total_held_min"]=pv.get("total_held_min",0.0)+max(0.0,held_min)
     today_str=tw_now().strftime("%Y-%m-%d")
     if today_str not in pv.get("trading_days",[]):
         pv.setdefault("trading_days",[]).append(today_str)
@@ -130,10 +139,18 @@ def _record_paper_validation(pnl:float=0.0, pct:float=0.0):
         pv["wins"]=pv.get("wins",0)+1
         pv["total_win_pnl"]=pv.get("total_win_pnl",0.0)+pnl
         pv["win_pct_sum"]=pv.get("win_pct_sum",0.0)+pct
+        pv["largest_win_pnl"]=max(pv.get("largest_win_pnl",0.0),pnl)
+        cur=pv.get("current_streak",0)
+        pv["current_streak"]=cur+1 if cur>=0 else 1
+        pv["max_win_streak"]=max(pv.get("max_win_streak",0),pv["current_streak"])
     elif pnl<0:
         pv["losses"]=pv.get("losses",0)+1
         pv["total_loss_pnl"]=pv.get("total_loss_pnl",0.0)+pnl  # 存負數，方便後面算profit factor時取絕對值
         pv["loss_pct_sum"]=pv.get("loss_pct_sum",0.0)+pct
+        pv["largest_loss_pnl"]=min(pv.get("largest_loss_pnl",0.0),pnl)
+        cur=pv.get("current_streak",0)
+        pv["current_streak"]=cur-1 if cur<=0 else -1
+        pv["max_loss_streak"]=max(pv.get("max_loss_streak",0),abs(pv["current_streak"]))
 
 def _record_feature_log(sym:str, pos:Dict, pnl:float, pct:float, tag:str):
     """每筆交易平倉時記錄當時餵給LightGBM的完整特徵向量+結果，跨天累積不會被_reset_daily清空。
@@ -160,21 +177,64 @@ def _paper_validation_progress() -> dict:
     win_rate=round(wins/(wins+losses)*100,1) if (wins+losses)>0 else 0.0
     avg_win_pct=round(pv.get("win_pct_sum",0.0)/wins,2) if wins>0 else 0.0
     avg_loss_pct=round(pv.get("loss_pct_sum",0.0)/losses,2) if losses>0 else 0.0
+    # 期望值(Expectancy)：平均每一筆交易賺賠多少錢，是判斷一個策略「平均每動一次手會發生什麼事」
+    # 最直接的數字，比單獨看勝率或獲利因子更貼近實際盈虧感受——勝率高但期望值是負的，代表小贏多次
+    # 但偶爾大賠，整體還是賠錢；這個數字才是真正該優化的目標。
+    expectancy=round((total_win+total_loss)/trades,1) if trades>0 else 0.0
+    avg_held_min=round(pv.get("total_held_min",0.0)/trades,1) if trades>0 else 0.0
     return {"trades":trades,"days":days,"min_trades":PAPER_VALIDATION_MIN_TRADES,
             "min_days":PAPER_VALIDATION_MIN_DAYS,"ready_for_real":ok,
             "win_rate":win_rate,"profit_factor":profit_factor,
             "avg_win_pct":avg_win_pct,"avg_loss_pct":avg_loss_pct,
-            "total_pnl":round(total_win+total_loss,0)}
+            "total_pnl":round(total_win+total_loss,0),
+            "expectancy_per_trade":expectancy,
+            "largest_win_pnl":round(pv.get("largest_win_pnl",0.0),0),
+            "largest_loss_pnl":round(pv.get("largest_loss_pnl",0.0),0),
+            "max_win_streak":pv.get("max_win_streak",0),"max_loss_streak":pv.get("max_loss_streak",0),
+            "avg_held_min":avg_held_min}
 
 ANNUALIZED_RELIABLE_MIN_DAYS = 20  # 少於這個交易日數，年化外推會被單一極端的好/壞日子放大到失真，不該被當真
 
+MAX_DRAWDOWN_HALT_PCT = 15.0  # 累積回撤達這個百分比，停止開新倉直到使用者手動確認恢復——這跟「今日虧損3%」
+                              # 是不同層級的保護：每日停損防的是單日急殺，這個防的是「連續好幾天慢慢流血」，
+                              # 慢性虧損可能永遠不會單日觸發3%，但累積起來一樣會把帳戶掏空。
+
+def _check_drawdown_circuit_breaker() -> bool:
+    """檢查目前的估計權益，相對歷史最高點的回撤是否已經達到需要停手的程度。回傳True代表已經
+    觸發暫停(或本來就已經暫停中)，False代表可以正常開新倉。
+    用「昨天收盤權益(來自equity_curve) + 今天目前為止的daily_pnl」當即時估計值，不用等到
+    今天14:30盤後才更新——回撤這種風險，越晚發現代價越高，不該每天才檢查一次。
+    一旦觸發，需要呼叫/auto/resume-after-drawdown手動清除才會恢復，不會像每日停損那樣
+    隔天自動恢復——累積回撤代表的問題比單日虧損更系統性，值得停下來認真檢視，不該自動繼續。"""
+    if auto_state.get("drawdown_halt"):
+        return True
+    curve=auto_state.get("equity_curve",[])
+    if not curve:
+        return False  # 還沒有任何歷史權益資料，無從判斷回撤，不阻擋(跟年化報酬率同樣的資料不足限制)
+    peak=max(c["equity"] for c in curve)
+    last_closed=curve[-1]["equity"]
+    current_est=last_closed+auto_state.get("daily_pnl",0.0)
+    if peak<=0: return False
+    dd_pct=(peak-current_est)/peak*100
+    if dd_pct>=MAX_DRAWDOWN_HALT_PCT:
+        auto_state["drawdown_halt"]=True
+        auto_state["drawdown_halt_info"]={"peak_equity":round(peak,2),"current_equity_est":round(current_est,2),
+                                           "drawdown_pct":round(dd_pct,2),"triggered_at":tw_now().strftime("%Y-%m-%d %H:%M:%S")}
+        _log(f"⚠️⚠️⚠️ [回撤保護觸發] 估計權益較歷史高點(${peak:,.0f})回撤{dd_pct:.1f}%，已達{MAX_DRAWDOWN_HALT_PCT}%門檻，"
+             f"停止開新倉(現有持倉仍會正常出場)。需要到系統分頁手動確認後才會恢復，不會隔天自動恢復。")
+        _persist_auto_state()
+        return True
+    return False
+
 def compute_performance_metrics() -> dict:
-    """從equity_curve(每個交易日收盤後記錄的帳戶總值)算出最大回撤、年化報酬率這些標準績效指標。
+    """從equity_curve(每個交易日收盤後記錄的帳戶總值)算出最大回撤、年化報酬率、Sharpe比率、
+    Calmar比率這些標準績效指標。
     重要：年化報酬率是用複利公式把『目前累積的報酬率』外推成『一年的話會是多少』，這個外推方式
     在交易日數還很少的時候統計上極不可靠——比如只跑了3天，其中1天剛好大賺3%，外推成年化可能
     變成一個荒謬的三位數百分比，那不是「這個策略真的能賺那麼多」，是「樣本太少，被單一個事件
     放大到失真」。這裡明確標記is_annualized_reliable跟附上原因，畫面顯示時應該照這個標記決定
-    要不要用警示色或加註說明，不能直接秀一個算出來的數字就讓人誤以為這是可信的預期報酬率。"""
+    要不要用警示色或加註說明，不能直接秀一個算出來的數字就讓人誤以為這是可信的預期報酬率。
+    Sharpe/Calmar比率依賴同一份年化外推，可靠度標記同樣適用，不是獨立算出來就比較可信。"""
     curve=auto_state.get("equity_curve",[])
     if len(curve)<2:
         return {"available":False,"reason":"權益曲線資料不足(至少需要2個交易日才能算出任何報酬率)",
@@ -198,6 +258,25 @@ def compute_performance_metrics() -> dict:
         if e>peak: peak=e; peak_date=c["date"]
         dd=(peak-e)/peak*100 if peak>0 else 0.0
         if dd>max_dd: max_dd=dd; worst_peak_date=peak_date; worst_trough_date=c["date"]
+    # Sharpe比率：用每日報酬率(不是每日損益金額)的平均值/標準差，年化用sqrt(252)——
+    # 標準差至少要兩個報酬率才算得出意義(n_days>=3才有2個日報酬率)，無風險利率簡化設為0
+    # (短線當沖策略的波動規模遠大於無風險利率，這個簡化對結果影響很小)。
+    daily_returns=[]
+    for i in range(1,len(equities)):
+        if equities[i-1]>0:
+            daily_returns.append((equities[i]-equities[i-1])/equities[i-1])
+    sharpe_ratio=None
+    if len(daily_returns)>=2:
+        mean_r=sum(daily_returns)/len(daily_returns)
+        var_r=sum((r-mean_r)**2 for r in daily_returns)/(len(daily_returns)-1)
+        std_r=var_r**0.5
+        if std_r>0:
+            sharpe_ratio=round(mean_r/std_r*(252**0.5),2)
+    # Calmar比率：年化報酬率/最大回撤，衡量「每承受1%回撤風險，換到多少年化報酬」，
+    # 業界沒有Sharpe那麼通用，但對回撤風險的敏感度比Sharpe更直接(Sharpe用標準差，不分上漲下跌波動)
+    calmar_ratio=None
+    if annualized_return_pct is not None and max_dd>0:
+        calmar_ratio=round(annualized_return_pct/max_dd,2)
     is_reliable=n_days>=ANNUALIZED_RELIABLE_MIN_DAYS
     return {
         "available":True,"trading_days":n_days,
@@ -206,10 +285,11 @@ def compute_performance_metrics() -> dict:
         "annualized_return_pct":round(annualized_return_pct,2) if annualized_return_pct is not None else None,
         "max_drawdown_pct":round(max_dd,3),
         "max_drawdown_peak_date":worst_peak_date,"max_drawdown_trough_date":worst_trough_date,
+        "sharpe_ratio":sharpe_ratio,"calmar_ratio":calmar_ratio,
         "is_annualized_reliable":is_reliable,
         "reliability_note":None if is_reliable else
-            f"只有{n_days}個交易日的資料，年化報酬率用複利外推會被單一好/壞日子放大到失真，"
-            f"建議累積到至少{ANNUALIZED_RELIABLE_MIN_DAYS}個交易日後才認真參考這個數字",
+            f"只有{n_days}個交易日的資料，年化報酬率/Sharpe/Calmar比率用複利外推會被單一好/壞日子放大到失真，"
+            f"建議累積到至少{ANNUALIZED_RELIABLE_MIN_DAYS}個交易日後才認真參考這些數字",
     }
 
 # ══════════════════════════════════════════════════════════════════
@@ -662,7 +742,7 @@ def auto_trade_tick():
             })
             auto_state["trade_history"]=auto_state["trade_history"][:50]
             if auto_state.get("paper_mode"):
-                _record_paper_validation(net_pnl,pp)
+                _record_paper_validation(net_pnl,pp,held_min)
                 _record_feature_log(sym,pos,net_pnl,pp,tag)
             # 漲跌停鎖死風險提示（不對稱）：做空遇漲停鎖死是真正危險（違約交割+借券費），
             # 做多遇跌停沖不掉則只是變成一般T+2持股，風險輕微，用不同等級的提示
@@ -679,7 +759,7 @@ def auto_trade_tick():
         continue
     auto_state["positions"]=[p for p in auto_state["positions"] if p["sym"] not in to_close]
     # 開倉（僅在09:30-13:00主動交易時段，避開開盤亂流與尾盤風險）
-    if not can_open_new_position():
+    if not can_open_new_position() or _check_drawdown_circuit_breaker():
         existing=set()
         candidates_pool=[]
     else:
@@ -888,7 +968,7 @@ def force_close_all():
             })
             auto_state["trade_history"]=auto_state["trade_history"][:50]
             if auto_state.get("paper_mode"):
-                _record_paper_validation(net_pnl,pp_fc)
+                _record_paper_validation(net_pnl,pp_fc,(time.time()-pos.get("opened_at",time.time()))/60)
                 _record_feature_log(sym,pos,net_pnl,pp_fc,"強制平倉")
         except Exception as e:
             logger.warning(f"強制平倉{sym}損益計算失敗（委託仍已送出成功）: {e}")
@@ -1290,6 +1370,20 @@ async def get_paper_validation():
 async def get_performance_metrics():
     """年化報酬率/最大回撤等標準績效指標，從每日收盤後記錄的權益曲線算出來"""
     return compute_performance_metrics()
+
+@app.post("/auto/resume-after-drawdown")
+async def resume_after_drawdown():
+    """手動清除累積回撤保護的暫停狀態——刻意不做成自動恢復，累積回撤代表的問題比單日虧損
+    更系統性(可能是模型本身失準、市場環境系統性不利等)，值得人看過數字後自己決定要不要繼續，
+    不應該隔天自動繼續嘗試同一套邏輯。"""
+    if not auto_state.get("drawdown_halt"):
+        return {"success":True,"message":"目前沒有處於回撤保護暫停狀態"}
+    info=auto_state.get("drawdown_halt_info")
+    auto_state["drawdown_halt"]=False
+    auto_state["drawdown_halt_info"]=None
+    _persist_auto_state()
+    _log("[回撤保護解除]使用者已手動確認，恢復正常開新倉")
+    return {"success":True,"message":"已解除回撤保護暫停","previous_trigger":info}
 
 @app.get("/auto/feature_log.csv")
 async def export_feature_log():
