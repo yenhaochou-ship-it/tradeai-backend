@@ -34,7 +34,7 @@ from config import (
     SCAN_UNIVERSE, SECTOR_MAP,
     PAPER_VALIDATION_MIN_TRADES, PAPER_VALIDATION_MIN_DAYS,
     MAX_TRADES_PER_DAY, CONSEC_LOSS_STOP,
-    max_allowed_spread_pct, next_settlement_date,
+    max_allowed_spread_pct, next_settlement_date, tick_size,
 )
 from state import price_cache
 from signals import (
@@ -419,13 +419,14 @@ def auto_trade_tick():
             # 重要修正：pos["qty"] 是「張」數（1張=1000股），所有金額計算必須換算成股數，
             # 否則損益會被低估1000倍，導致每日虧損/獲利風控門檻形同虛設
             shares = pos["qty"] * 1000
-            entry_p,exit_p = (pos["entry"],p) if pos["dir"]=="L" else (p,pos["entry"])
+            fill_p=_apply_slippage(p,is_buy=False)  # 模擬滑價：賣出假設要少收1個tick(觸發出場後的真實成交價，不是觸發判斷本身)
+            entry_p,exit_p = (pos["entry"],fill_p) if pos["dir"]=="L" else (fill_p,pos["entry"])
             cost=calc_round_trip_cost(entry_p,exit_p,shares)
-            gross=(p-pos["entry"])*shares*(1 if pos["dir"]=="L" else -1)
+            gross=(fill_p-pos["entry"])*shares*(1 if pos["dir"]=="L" else -1)
             net_pnl=gross-cost["total_cost"]
             settlement_date=None
             if auto_state.get("paper_mode") and pos["dir"]=="L":
-                settlement_date=_record_paper_close(p,shares,tw_now().strftime("%Y-%m-%d"))
+                settlement_date=_record_paper_close(fill_p,shares,tw_now().strftime("%Y-%m-%d"))
             auto_state["daily_pnl"]+=net_pnl; auto_state["daily_trades"]+=1
             if net_pnl>0: auto_state["daily_win"]+=1; auto_state["consec_loss"]=0
             else:
@@ -438,10 +439,10 @@ def auto_trade_tick():
                     _log(f"連虧{auto_state['consec_loss']}次，今日停止交易")
             tag="止盈" if pp>=cfg["tp"] else "停損" if pp<=-cfg["sl"] else "持倉超時" if time_up else "反轉"
             exit_reason=build_exit_reason(tag,cfg,held_min,pp)
-            _log(f"{tag} {pos['dir']} @{p:.2f} 淨損益${net_pnl:.0f}(毛利${gross:.0f}-成本${cost['total_cost']:.0f})",sym)
+            _log(f"{tag} {pos['dir']} @{fill_p:.2f} 淨損益${net_pnl:.0f}(毛利${gross:.0f}-成本${cost['total_cost']:.0f})",sym)
             auto_state["trade_history"].insert(0,{
                 "sym":sym,"dir":pos["dir"],"qty":pos["qty"],"shares":shares,
-                "entry":pos["entry"],"exit":round(p,2),
+                "entry":pos["entry"],"exit":round(fill_p,2),
                 "total_cost_basis":round(pos["entry"]*shares,0),  # 進場總成本（股數×進場價）
                 "gross_pnl":round(gross,0),"fees":round(cost["total_cost"],0),
                 "pnl":round(net_pnl,0),"pct":round(pp,2),"tag":tag,
@@ -575,11 +576,12 @@ def auto_trade_tick():
             skipped_unaffordable.append((sym,p))
             continue
         grade=lgbm_grade(lgbm_conf)
-        if auto_state.get("paper_mode"): _record_paper_open(p,qty*1000)
+        fill_p=_apply_slippage(p,is_buy=True)  # 模擬滑價：當沖只做多，買進假設要多付1個tick才成交
+        if auto_state.get("paper_mode"): _record_paper_open(fill_p,qty*1000)
         auto_state["positions"].append({
-            "sym":sym,"dir":dir_,"qty":qty,"entry":p,
-            "sl":round(p*(1-cfg["sl"]/100) if dir_=="L" else p*(1+cfg["sl"]/100),2),
-            "tp":round(p*(1+cfg["tp"]/100) if dir_=="L" else p*(1-cfg["tp"]/100),2),
+            "sym":sym,"dir":dir_,"qty":qty,"entry":fill_p,
+            "sl":round(fill_p*(1-cfg["sl"]/100) if dir_=="L" else fill_p*(1+cfg["sl"]/100),2),
+            "tp":round(fill_p*(1+cfg["tp"]/100) if dir_=="L" else fill_p*(1-cfg["tp"]/100),2),
             "open_time":tw_now().strftime("%H:%M:%S"),
             "opened_at":time.time(),  # 數值時間戳，用於計算持倉分鐘數（短炒持倉時間上限判斷）
             "grade":grade,"regime":adv["regime"],"entry_reason":build_entry_reason(lgbm_conf,adv,dir_),
@@ -619,24 +621,25 @@ def force_close_all():
             hist=price_cache.get(sym,[])
             p=hist[-1]["price"] if hist else pos["entry"]  # 拿不到最新價時退回進場價，避免崩潰但盡量準確記錄
             shares=pos["qty"]*1000
-            gross=(p-pos["entry"])*shares*(1 if pos["dir"]=="L" else -1)
+            fill_p=_apply_slippage(p,is_buy=False)  # 強制平倉也是真實出場，一樣套用滑價假設
+            gross=(fill_p-pos["entry"])*shares*(1 if pos["dir"]=="L" else -1)
             cost=calc_round_trip_cost(
-                pos["entry"] if pos["dir"]=="L" else p,
-                p if pos["dir"]=="L" else pos["entry"],
+                pos["entry"] if pos["dir"]=="L" else fill_p,
+                fill_p if pos["dir"]=="L" else pos["entry"],
                 shares
             )["total_cost"]
             net_pnl=gross-cost
             settlement_date=None
             if auto_state.get("paper_mode") and pos["dir"]=="L":
-                settlement_date=_record_paper_close(p,shares,tw_now().strftime("%Y-%m-%d"))
+                settlement_date=_record_paper_close(fill_p,shares,tw_now().strftime("%Y-%m-%d"))
             auto_state["daily_pnl"]+=net_pnl; auto_state["daily_trades"]+=1
             if net_pnl>0: auto_state["daily_win"]+=1; auto_state["consec_loss"]=0
             else: auto_state["consec_loss"]+=1
-            _log(f"[強制平倉] {pos['dir']} @{p:.2f} 淨損益${net_pnl:.0f}",sym)
-            pp_fc=(p-pos["entry"])/pos["entry"]*100*(1 if pos["dir"]=="L" else -1)
+            _log(f"[強制平倉] {pos['dir']} @{fill_p:.2f} 淨損益${net_pnl:.0f}",sym)
+            pp_fc=(fill_p-pos["entry"])/pos["entry"]*100*(1 if pos["dir"]=="L" else -1)
             auto_state["trade_history"].insert(0,{
                 "sym":sym,"dir":pos["dir"],"qty":pos["qty"],"shares":shares,
-                "entry":pos["entry"],"exit":round(p,2),
+                "entry":pos["entry"],"exit":round(fill_p,2),
                 "total_cost_basis":round(pos["entry"]*shares,0),
                 "gross_pnl":round(gross,0),"fees":round(cost,0),
                 "pnl":round(net_pnl,0),"pct":round(pp_fc,2),"tag":"強制平倉",
@@ -734,6 +737,15 @@ def _prune_settled_paper_pending():
     這些錢已經算進paper_capital裡了(平倉時就立刻+=過)，這裡只是清掉「不再需要鎖住」的舊紀錄。"""
     today=tw_now().strftime("%Y-%m-%d")
     auto_state["paper_pending_settlements"]=[p for p in auto_state["paper_pending_settlements"] if p["settle_date"]>today]
+
+def _apply_slippage(price:float, is_buy:bool) -> float:
+    """模擬真實成交的滑價：用tick_size()算出這個價位的最小跳動單位，買進假設要多付1個tick才能成交
+    (吃掉賣方掛單)，賣出假設要少收1個tick(被買方掛單吃掉)。原本模擬模式假設「完全用看到的報價成交」，
+    等於零滑價的理想情況，會讓模擬績效系統性地比真實交易樂觀——現實中下單到成交之間有延遲，
+    而且OFI訊號爆量時，其他人也看得到，最佳五檔的對手價很可能瞬間被掃掉一截。1個tick是
+    相對保守、有實際根據的起點(不是衝著最壞情況的「地獄級」假設)，不是憑感覺挑的數字。"""
+    tick=tick_size(price)
+    return round(price+tick if is_buy else price-tick, 2)
 
 def _record_paper_open(entry_price:float, shares:int):
     """模擬模式開倉：立刻從paper_capital扣掉成本+買進手續費(買進不像賣出有交割延遲，
