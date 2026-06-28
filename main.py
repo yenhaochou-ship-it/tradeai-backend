@@ -79,7 +79,7 @@ _auto_state_defaults = {
     # 直接回答「今天為什麼沒有交易」，不用再去猜log文字背後的原因。
     "funnel":{"scanned":0,"bad_time":0,"no_trade_zone":0,"not_eligible":0,"limit_down_risk":0,
               "vwap_reject":0,"wide_spread":0,"no_model":0,"low_confidence":0,"sector_dup":0,"unaffordable":0,
-              "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0},
+              "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0,"order_failed":0},
     "ofi_failed_symbols":[],  # OFI訂閱失敗的股票代號清單，點log時顯示具體是哪幾檔
     "capital_info":None,  # 最近一次資金同步的完整明細(balance/available/pending_settlement/available_after_settlement)
 }
@@ -335,24 +335,38 @@ def _reset_daily():
             "_loss_stop_logged":False,"_profit_lock_logged":False,"_afford_warn_logged":False,"_zero_capital_logged":False,"trade_history":[],
             "funnel":{"scanned":0,"bad_time":0,"no_trade_zone":0,"not_eligible":0,"limit_down_risk":0,
                       "vwap_reject":0,"wide_spread":0,"no_model":0,"low_confidence":0,"sector_dup":0,"unaffordable":0,
-                      "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0}})
+                      "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0,"order_failed":0}})
         _prune_settled_paper_pending()
         _log("每日計數器重置 ✓")
 
-def _place_real_order(sym:str, action, qty:int):
+def _place_real_order(sym:str, action, qty:int) -> bool:
+    """回傳True代表委託至少沒有立即被拒絕，False代表委託失敗(不該繼續把這筆當成已經發生的真實持倉/平倉)。
+    重要：這只確認「委託送出去了，沒有馬上被拒絕」，不代表「已經真的成交」——Shioaji的place_order()
+    回傳是同步的PendingSubmit/Submitted/Failed其中一種，要完整確認真的成交(Filled)，理論上還需要
+    額外呼叫update_status()或註冊on_order callback盯著後續狀態變化，這裡還沒做到那一層，
+    是已知的下一步，正式切換成真實下單前應該要補上，不要因為這裡回傳True就誤以為已經100%確認成交。
+    原本完全沒檢查place_order()的回傳值，等於委託被券商/交易所立即拒絕時(資金不足/該股票剛好被
+    暫停交易/委託內容有誤等)，整個系統毫不知情，照樣把這筆當成真實成功的持倉/平倉繼續往下處理，
+    形成跟真實帳戶狀態脫鉤的「幻影持倉」。"""
     if auto_state.get("paper_mode"):
         _log(f"[模擬]未送出真實委託 {sym} {action} {qty}張",sym)
-        return
-    if not sinopac_api or not stock_account: return
+        return True
+    if not sinopac_api or not stock_account: return False
     try:
         c=sinopac_api.Contracts.Stocks.get(sym)
-        if not c: return
+        if not c: return False
         o=sinopac_api.Order(price=0,quantity=qty,action=action,
             price_type=sj.constant.StockPriceType.MKT,
             order_type=sj.constant.OrderType.ROD,account=stock_account)
-        sinopac_api.place_order(c,o)
+        trade=sinopac_api.place_order(c,o)
+        status=str(getattr(getattr(trade,"status",None),"status",""))
+        if "fail" in status.lower():
+            logger.warning(f"委託被立即拒絕 {sym}: status={status}")
+            return False
+        return True
     except Exception as e:
         logger.warning(f"委託失敗 {sym}: {e}")
+        return False
 
 def auto_trade_tick():
     """每30秒執行 — 核心自動交易"""
@@ -415,6 +429,14 @@ def auto_trade_tick():
                 if (pos["dir"]=="L" and sig["action"]=="sell") or \
                    (pos["dir"]=="S" and sig["action"]=="buy"): close=True
         if close:
+            close_act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
+            if not _place_real_order(sym,close_act,pos["qty"]):
+                # 修正：平倉委託被拒絕時絕對不能繼續記錄成「已經平倉」——這比開倉那邊的同類問題更危險，
+                # 因為這樣會讓系統以為這筆持倉已經結束、不再監控，但永豐那邊這筆其實還真實開著，
+                # 完全沒人在看著它的停損停利。不往下走帳本邏輯，留在positions裡，下個tick再試一次平倉。
+                auto_state["funnel"]["order_failed"]=auto_state["funnel"].get("order_failed",0)+1
+                _log(f"[委託失敗]{sym} 平倉委託被拒絕或送出失敗，持倉保留，下次tick重試",sym)
+                continue
             # 計算真實淨損益（扣除手續費+當沖證交稅）
             # 重要修正：pos["qty"] 是「張」數（1張=1000股），所有金額計算必須換算成股數，
             # 否則損益會被低估1000倍，導致每日虧損/獲利風控門檻形同虛設
@@ -463,8 +485,6 @@ def auto_trade_tick():
                 _log(f"[高風險] {sym} 接近/觸及漲停，做空回補可能掛不掉，可能產生借券費用與違約交割風險",sym)
             if pos["dir"]=="L" and cinfo["limit_down"]>0 and p<=cinfo["limit_down"]*1.002:
                 _log(f"[提示] {sym} 接近/觸及跌停，今日可能無法賣出，將自動變成一般持股待T+2交割（非違約風險）",sym)
-            close_act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
-            _place_real_order(sym,close_act,pos["qty"])
             to_close.append(sym)
       except Exception as e:
         # 防禦性隔離：跟下面候選評估迴圈一樣的道理，但這裡更關鍵——一檔持倉檢查時crash，
@@ -577,6 +597,14 @@ def auto_trade_tick():
             continue
         grade=lgbm_grade(lgbm_conf)
         fill_p=_apply_slippage(p,is_buy=True)  # 模擬滑價：當沖只做多，買進假設要多付1個tick才成交
+        pool_tag="[股票池]" if (sym not in auto_state["watchlist"]) else ""
+        act=sj.constant.Action.Buy if dir_=="L" else sj.constant.Action.Sell
+        if not _place_real_order(sym,act,qty):
+            # 修正：委託被立即拒絕時，絕對不能繼續往下記錄成持倉/扣模擬資金——
+            # 不然會變成系統以為自己買到了，但永豐那邊根本沒有這筆交易，帳本直接對不起來。
+            fn["order_failed"]=fn.get("order_failed",0)+1
+            _log(f"[委託失敗]{sym} 買進委託被拒絕或送出失敗，不記錄為持倉",sym)
+            continue
         if auto_state.get("paper_mode"): _record_paper_open(fill_p,qty*1000)
         auto_state["positions"].append({
             "sym":sym,"dir":dir_,"qty":qty,"entry":fill_p,
@@ -587,9 +615,6 @@ def auto_trade_tick():
             "grade":grade,"regime":adv["regime"],"entry_reason":build_entry_reason(lgbm_conf,adv,dir_),
             "lgbm_conf":round(lgbm_conf,1),"features":dict(zip(ML_FEATURE_NAMES,lgbm_feats)) if lgbm_feats else {},
         })
-        act=sj.constant.Action.Buy if dir_=="L" else sj.constant.Action.Sell
-        _place_real_order(sym,act,qty)
-        pool_tag="[股票池]" if (sym not in auto_state["watchlist"]) else ""
         _log(f"{pool_tag}{'做多▲' if dir_=='L' else '做空▼'} {qty}張@{p:.2f} LightGBM信心{lgbm_conf:.0f}% "
              f"({grade}級) 市場環境:{adv['regime']}",sym)
         existing.add(sym)
@@ -615,8 +640,18 @@ def pre_market_prep():
 def force_close_all():
     if not auto_state["positions"]: return
     _log(f"13:20 強制平倉 {len(auto_state['positions'])} 筆（當沖規則：禁止留倉過夜）")
+    still_open=[]
     for pos in list(auto_state["positions"]):
         sym=pos["sym"]
+        act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
+        if not _place_real_order(sym,act,pos["qty"]):
+            # 修正：強制平倉失敗(例如剛好跌停鎖死)是真正需要使用者注意的情況——已經是13:20了，
+            # 不像一般時段還有很多次30秒tick可以重試，視窗快關了。不往下記錄成已平倉，
+            # 保留在positions裡讓使用者在畫面上看得到「這筆沒有真的平倉成功」，需要去手動處理。
+            fn=auto_state["funnel"]; fn["order_failed"]=fn.get("order_failed",0)+1
+            _log(f"[強制平倉失敗]{sym} 委託被拒絕(可能漲跌停鎖死)，這筆會留倉過夜，請手動確認",sym)
+            still_open.append(pos)
+            continue
         try:
             hist=price_cache.get(sym,[])
             p=hist[-1]["price"] if hist else pos["entry"]  # 拿不到最新價時退回進場價，避免崩潰但盡量準確記錄
@@ -654,10 +689,8 @@ def force_close_all():
                 _record_paper_validation(net_pnl,pp_fc)
                 _record_feature_log(sym,pos,net_pnl,pp_fc,"強制平倉")
         except Exception as e:
-            logger.warning(f"強制平倉{sym}損益計算失敗（委託仍會送出）: {e}")
-        act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
-        _place_real_order(sym,act,pos["qty"])
-    auto_state["positions"]=[]
+            logger.warning(f"強制平倉{sym}損益計算失敗（委託仍已送出成功）: {e}")
+    auto_state["positions"]=still_open
     _persist_auto_state()
 
 def post_market_summary():
