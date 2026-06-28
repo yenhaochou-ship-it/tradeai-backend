@@ -1040,9 +1040,6 @@ def post_market_summary():
         auto_state["equity_curve"]=curve[-365:]  # 留最近365筆，避免無限增長(一年的交易日數綽綽有餘)
         _persist_auto_state()
 
-def ml_training_window():
-    _log("21:00 ML訓練時段開始（前端訓練請在學習分頁執行）")
-
 # ══════════════════════════════════════════════════════════════════
 # 全市場飆股雷達：定期掃描SCAN_UNIVERSE，排序技術面動能最強的股票
 # 老實說明：這是技術指標排序，不是漲跌預測保證，已在前端文案標明
@@ -1195,7 +1192,6 @@ scheduler.add_job(_refresh_capital_from_account, 'interval',minutes=5,id='capita
 scheduler.add_job(pre_market_prep,    CronTrigger(hour=8, minute=0, day_of_week='mon-fri',timezone='Asia/Taipei'),id='prep')
 scheduler.add_job(force_close_all,    CronTrigger(hour=13,minute=20,day_of_week='mon-fri',timezone='Asia/Taipei'),id='force_close')
 scheduler.add_job(post_market_summary,CronTrigger(hour=14,minute=30,day_of_week='mon-fri',timezone='Asia/Taipei'),id='post')
-scheduler.add_job(ml_training_window, CronTrigger(hour=21,minute=0, day_of_week='mon-fri',timezone='Asia/Taipei'),id='ml')
 scheduler.add_job(update_institutional_cache, CronTrigger(hour=15,minute=30,day_of_week='mon-fri',timezone='Asia/Taipei'),id='inst_flow') # 證交所約15:00後公布當日三大法人資料
 scheduler.start()
 logger.info("TradeAI Pro 後端 v2.0 排程器啟動 — 台股時段自動交易就緒")
