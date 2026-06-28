@@ -1136,7 +1136,8 @@ def _refresh_capital_from_account():
         cap_info={"account":str(stock_account),"balance":balance,"available":avail,
                 "pending_settlement":pending_settlement,
                 "available_after_settlement":available_after_settlement,
-                "settlement_schedule":settlement_schedule}
+                "settlement_schedule":settlement_schedule,
+                "synced_at":time.time()}
         auto_state["capital_info"]=cap_info  # 持久化存起來，前端點"資金已同步"那行log時可以隨時查詢最新明細
         return cap_info
     except Exception as e:
