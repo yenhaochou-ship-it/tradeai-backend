@@ -1093,6 +1093,10 @@ async def auto_status():
             _log(f"⚠️ LightGBM模型尚未載入：{lgbm_status['error']}")
     return {**auto_state,"market":market_status(),
             "paper_available_capital":round(get_paper_available_capital(),2),
+            "min_profitable_move_pct":round(min_profitable_move_pct(auto_state.get("fee_discount",FEE_DISCOUNT)),3),
+            "paper_validation_min_trades":PAPER_VALIDATION_MIN_TRADES,
+            "paper_validation_min_days":PAPER_VALIDATION_MIN_DAYS,
+            "paper_validation_progress":_paper_validation_progress(),
             "lgbm_model":lgbm_status,
             "price_cache_size":{k:len(v) for k,v in price_cache.items()},
             "watchdog":{"seconds_since_tick":round(time.time()-_watchdog_state["last_tick_at"],1),
