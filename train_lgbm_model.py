@@ -506,14 +506,20 @@ def main():
 
     train_data = lgb.Dataset(X_train, label=y_train, weight=w_train, feature_name=ML_FEATURE_NAMES)
     valid_data = lgb.Dataset(X_valid, label=y_valid, feature_name=ML_FEATURE_NAMES, reference=train_data)
+    # 參數比第一版(AUC 0.638)更保守：來源是1分K的樣本(雖然用stride=5取樣降低重疊，
+    # 雜訊還是比5分K高很多)，原本learning_rate=0.05/min_data_in_leaf=30給樹太多自由度，
+    # 容易硬背某個特定樣本的微觀波動。調低學習率、拉高每個葉節點最少樣本數、加上明確的
+    # max_depth上限，三個一起讓樹長得保守一點，犧牲一點訓練集表現換驗證集穩定度。
+    # 對應地把num_boost_round跟early_stopping的耐心值都調大，不然learning_rate變慢、
+    # 還用原來500輪/30輪耐心，會在還沒收斂前就被提早停掉，等於白白浪費了調低學習率的用意。
     params = {
         "objective": "binary", "metric": "auc", "verbosity": -1,
-        "learning_rate": 0.05, "num_leaves": 31, "min_data_in_leaf": 30,
+        "learning_rate": 0.02, "num_leaves": 31, "max_depth": 5, "min_data_in_leaf": 100,
         "feature_fraction": 0.8, "bagging_fraction": 0.8, "bagging_freq": 5,
     }
     print("\n開始訓練...")
-    model = lgb.train(params, train_data, num_boost_round=500, valid_sets=[valid_data],
-                       callbacks=[lgb.early_stopping(30), lgb.log_evaluation(50)])
+    model = lgb.train(params, train_data, num_boost_round=2000, valid_sets=[valid_data],
+                       callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)])
 
     pred_valid = model.predict(X_valid)
     auc = roc_auc_score(y_valid, pred_valid)
