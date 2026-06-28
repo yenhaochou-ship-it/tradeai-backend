@@ -205,10 +205,14 @@ def _check_drawdown_circuit_breaker() -> bool:
     用「昨天收盤權益(來自equity_curve) + 今天目前為止的daily_pnl」當即時估計值，不用等到
     今天14:30盤後才更新——回撤這種風險，越晚發現代價越高，不該每天才檢查一次。
     一旦觸發，需要呼叫/auto/resume-after-drawdown手動清除才會恢復，不會像每日停損那樣
-    隔天自動恢復——累積回撤代表的問題比單日虧損更系統性，值得停下來認真檢視，不該自動繼續。"""
+    隔天自動恢復——累積回撤代表的問題比單日虧損更系統性，值得停下來認真檢視，不該自動繼續。
+    修正：只看「目前模式(模擬/真實)」自己的權益曲線，不要跟另一種模式混在一起比——模擬預設
+    1000萬起始資金，真實帳戶規模通常完全不同，混在同一條曲線上比「歷史最高點」會被其中一種
+    模式的絕對金額永遠壓著，另一種模式的回撤判斷會完全失真(可能誤觸發，也可能永遠不會觸發)。"""
     if auto_state.get("drawdown_halt"):
         return True
-    curve=auto_state.get("equity_curve",[])
+    cur_mode="paper" if auto_state.get("paper_mode") else "real"
+    curve=[c for c in auto_state.get("equity_curve",[]) if c.get("mode")==cur_mode]
     if not curve:
         return False  # 還沒有任何歷史權益資料，無從判斷回撤，不阻擋(跟年化報酬率同樣的資料不足限制)
     peak=max(c["equity"] for c in curve)
@@ -219,14 +223,15 @@ def _check_drawdown_circuit_breaker() -> bool:
     if dd_pct>=MAX_DRAWDOWN_HALT_PCT:
         auto_state["drawdown_halt"]=True
         auto_state["drawdown_halt_info"]={"peak_equity":round(peak,2),"current_equity_est":round(current_est,2),
-                                           "drawdown_pct":round(dd_pct,2),"triggered_at":tw_now().strftime("%Y-%m-%d %H:%M:%S")}
-        _log(f"⚠️⚠️⚠️ [回撤保護觸發] 估計權益較歷史高點(${peak:,.0f})回撤{dd_pct:.1f}%，已達{MAX_DRAWDOWN_HALT_PCT}%門檻，"
+                                           "drawdown_pct":round(dd_pct,2),"mode":cur_mode,
+                                           "triggered_at":tw_now().strftime("%Y-%m-%d %H:%M:%S")}
+        _log(f"⚠️⚠️⚠️ [回撤保護觸發] {'模擬' if cur_mode=='paper' else '真實'}帳戶估計權益較歷史高點(${peak:,.0f})回撤{dd_pct:.1f}%，已達{MAX_DRAWDOWN_HALT_PCT}%門檻，"
              f"停止開新倉(現有持倉仍會正常出場)。需要到系統分頁手動確認後才會恢復，不會隔天自動恢復。")
         _persist_auto_state()
         return True
     return False
 
-def compute_performance_metrics() -> dict:
+def compute_performance_metrics(mode:Optional[str]=None) -> dict:
     """從equity_curve(每個交易日收盤後記錄的帳戶總值)算出最大回撤、年化報酬率、Sharpe比率、
     Calmar比率這些標準績效指標。
     重要：年化報酬率是用複利公式把『目前累積的報酬率』外推成『一年的話會是多少』，這個外推方式
@@ -234,16 +239,23 @@ def compute_performance_metrics() -> dict:
     變成一個荒謬的三位數百分比，那不是「這個策略真的能賺那麼多」，是「樣本太少，被單一個事件
     放大到失真」。這裡明確標記is_annualized_reliable跟附上原因，畫面顯示時應該照這個標記決定
     要不要用警示色或加註說明，不能直接秀一個算出來的數字就讓人誤以為這是可信的預期報酬率。
-    Sharpe/Calmar比率依賴同一份年化外推，可靠度標記同樣適用，不是獨立算出來就比較可信。"""
+    Sharpe/Calmar比率依賴同一份年化外推，可靠度標記同樣適用，不是獨立算出來就比較可信。
+    修正：mode參數讓呼叫端可以指定只看"paper"或"real"——模擬跟真實帳戶的資金規模通常完全不同
+    (模擬預設1000萬，真實帳戶可能小很多)，equity_curve如果不分開看，混在一起算「歷史最高點」
+    跟「回撤」會變得沒有意義(隨時可能因為兩種模式的資金規模差異，製造出跟實際績效無關的假回撤)。
+    不指定mode時(None)用全部資料，僅供「還沒有任何真實/模擬切換經驗」的舊資料相容，新的呼叫端
+    應該明確指定要看哪一種。"""
     curve=auto_state.get("equity_curve",[])
+    if mode is not None:
+        curve=[c for c in curve if c.get("mode")==mode]
     if len(curve)<2:
-        return {"available":False,"reason":"權益曲線資料不足(至少需要2個交易日才能算出任何報酬率)",
+        return {"available":False,"mode":mode,"reason":"權益曲線資料不足(至少需要2個交易日才能算出任何報酬率)",
                 "trading_days":len(curve)}
     equities=[c["equity"] for c in curve]
     start_equity=equities[0]; end_equity=equities[-1]
     n_days=len(curve)
     if start_equity<=0:
-        return {"available":False,"reason":"起始權益為0或負數，無法計算報酬率","trading_days":n_days}
+        return {"available":False,"mode":mode,"reason":"起始權益為0或負數，無法計算報酬率","trading_days":n_days}
     total_return_pct=(end_equity/start_equity-1)*100
     try:
         annualized_return_pct=((end_equity/start_equity)**(252/n_days)-1)*100
@@ -279,7 +291,7 @@ def compute_performance_metrics() -> dict:
         calmar_ratio=round(annualized_return_pct/max_dd,2)
     is_reliable=n_days>=ANNUALIZED_RELIABLE_MIN_DAYS
     return {
-        "available":True,"trading_days":n_days,
+        "available":True,"trading_days":n_days,"mode":mode,
         "start_equity":round(start_equity,2),"end_equity":round(end_equity,2),
         "total_return_pct":round(total_return_pct,3),
         "annualized_return_pct":round(annualized_return_pct,2) if annualized_return_pct is not None else None,
@@ -1355,7 +1367,9 @@ async def auto_status():
             "paper_validation_min_trades":PAPER_VALIDATION_MIN_TRADES,
             "paper_validation_min_days":PAPER_VALIDATION_MIN_DAYS,
             "paper_validation_progress":_paper_validation_progress(),
-            "performance_metrics":compute_performance_metrics(),
+            "performance_metrics":compute_performance_metrics("paper" if auto_state.get("paper_mode") else "real"),
+            "performance_metrics_real":compute_performance_metrics("real"),
+            "performance_metrics_paper":compute_performance_metrics("paper"),
             "lgbm_model":lgbm_status,
             "price_cache_size":{k:len(v) for k,v in price_cache.items()},
             "watchdog":{"seconds_since_tick":round(time.time()-_watchdog_state["last_tick_at"],1),
@@ -1367,9 +1381,10 @@ async def get_paper_validation():
     return _paper_validation_progress()
 
 @app.get("/auto/performance")
-async def get_performance_metrics():
-    """年化報酬率/最大回撤等標準績效指標，從每日收盤後記錄的權益曲線算出來"""
-    return compute_performance_metrics()
+async def get_performance_metrics(mode:Optional[str]=None):
+    """年化報酬率/最大回撤等標準績效指標，從每日收盤後記錄的權益曲線算出來。
+    mode可指定"paper"或"real"只看該模式自己的權益曲線，不指定則用目前正在運行的模式。"""
+    return compute_performance_metrics(mode or ("paper" if auto_state.get("paper_mode") else "real"))
 
 @app.post("/auto/resume-after-drawdown")
 async def resume_after_drawdown():
