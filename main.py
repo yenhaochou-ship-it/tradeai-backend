@@ -541,15 +541,26 @@ def send_telegram_alert(message:str) -> bool:
 def _snapshot(sym:str) -> Optional[Dict]:
     """回傳完整快照欄位(price/volume/buy_vol/sell_vol/tick_type)，不再只取price+volume兩個欄位。
     這些欄位都是snapshots()本來就會回傳的，之前只解出close跟total_volume，其他被丟掉了——
-    Phase 2(Order Flow近似/Bid-Ask Imbalance)會用到buy_vol/sell_vol/tick_type，不需要額外訂閱tick資料流。"""
+    Phase 2(Order Flow近似/Bid-Ask Imbalance)會用到buy_vol/sell_vol/tick_type，不需要額外訂閱tick資料流。
+    修正：原本except直接return None，完全沒有log——前端看到的只是「這檔顯示模擬」，
+    後端log也查不到任何蛛絲馬跡，沒辦法分辨是合約代號打錯(例如00631L少打一個0)、
+    現在非交易時段snapshots()本來就抓不到、還是真的連線出問題。加上log後至少能從
+    Railway的log判斷是哪一種，不用憑空猜。"""
     if not sinopac_api: return None
     try:
         c=sinopac_api.Contracts.Stocks.get(sym)
-        if not c: return None
+        if not c:
+            logger.warning(f"_snapshot({sym}): 永豐合約查不到這個代號，可能代號打錯或不是有效的證券代號")
+            return None
         s=sinopac_api.snapshots([c])
-        if not s: return None
+        if not s:
+            logger.warning(f"_snapshot({sym}): 永豐snapshots()回傳空結果(合約存在但抓不到報價，"
+                            f"非交易時段/該股票今天完全沒有成交時常見)")
+            return None
         return _parse_snapshot(s[0])
-    except: return None
+    except Exception as e:
+        logger.warning(f"_snapshot({sym}) 失敗: {e}")
+        return None
 
 def _parse_snapshot(snap) -> Dict:
     tt=getattr(snap,"tick_type",None)
