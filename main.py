@@ -1732,16 +1732,27 @@ async def get_price(symbol:str):
 # ── 交割記錄 ──────────────────────────────────────────────────────
 # ── 真實歷史K棒（取代前端亂數模擬，讓RSI/MACD/ML訓練都基於真實價格歷史）──────
 def _fetch_real_history(symbol:str, bars:int=90):
-    """內部函式：抓真實歷史K棒，供API端點與後端自身的price_cache暖機共用"""
+    """內部函式：抓真實歷史K棒，供API端點與後端自身的price_cache暖機共用。
+    修正：原本contract找不到/kbars回傳空值這兩個情況都是直接return []，沒有任何log——
+    前端拿到空陣列只能顯示「抓不到真實資料，退回模擬」，但完全不知道是合約查不到、
+    永豐這次回傳真的是空的、還是回傳了但筆數不夠(<20/<30門檻)。加上log後，
+    之後遇到「這檔股票一直抓不到真實圖表」可以直接去後端log查到底是哪一種原因，
+    而不是只能猜。"""
     if not sinopac_api: return []
     symbol=symbol.replace(".TW","").replace(".TWO","")
     try:
         contract=sinopac_api.Contracts.Stocks.get(symbol)
-        if not contract: return []
+        if not contract:
+            logger.warning(f"抓取{symbol}歷史K棒：永豐合約查不到這個代號(Contracts.Stocks.get回傳None)，"
+                            f"可能代號打錯、剛下市、或這個類型(例如槓桿型ETF)被歸在不同的合約分類")
+            return []
         end_d=tw_now()
         start_d=end_d-timedelta(days=10)
         kb=sinopac_api.kbars(contract,start=start_d.strftime("%Y-%m-%d"),end=end_d.strftime("%Y-%m-%d"))
-        if not kb or not kb.ts: return []
+        if not kb or not kb.ts:
+            logger.warning(f"抓取{symbol}歷史K棒：永豐kbars()回傳空資料(過去10天完全沒有任何1分K)，"
+                            f"可能是新上市/新掛牌天數不足、或近期完全沒有成交")
+            return []
         n=len(kb.ts)
         raw=[{"ts":kb.ts[i],"open":kb.Open[i],"high":kb.High[i],"low":kb.Low[i],
               "close":kb.Close[i],"volume":kb.Volume[i]} for i in range(n)]
@@ -1759,7 +1770,11 @@ def _fetch_real_history(symbol:str, bars:int=90):
                 "low":min(c["low"] for c in chunk),
                 "volume":sum(c["volume"] for c in chunk),
             })
-        return agg[-bars:]
+        result=agg[-bars:]
+        if len(result)<30:  # 30是前端/scan_top_stocks拿到結果後實際採用的最低門檻，這裡先預告
+            logger.info(f"抓取{symbol}歷史K棒：永豐回傳{n}筆1分K，聚合成5分K後只有{len(result)}筆"
+                        f"(<30)，呼叫端可能因此視為「資料不足」退回模擬資料")
+        return result
     except Exception as e:
         logger.warning(f"抓取{symbol}歷史K棒失敗: {e}")
         return []
