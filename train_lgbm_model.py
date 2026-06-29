@@ -78,7 +78,14 @@ SCAN_UNIVERSE = [
 LABEL_TP_PCT = 6.0
 LABEL_SL_PCT = 3.0
 LABEL_MAX_HOLD_MIN = 40
-MIN_PROFITABLE_MOVE_PCT = 0.32  # 跟main.py的min_profitable_move_pct()算出來的數字一致(約0.32%)
+MIN_PROFITABLE_MOVE_PCT = 0.32  # 個股版本，跟main.py個股當沖稅率算出來的數字一致(約0.32%)
+MIN_PROFITABLE_MOVE_PCT_ETF = 0.27  # ETF版本：證交稅0.1%(比個股當沖0.15%低)，算出來的門檻較低，
+                                     # 跟main.py加了is_etf()判斷後算出來的數字一致(約0.27%)
+
+def _is_etf(symbol:str) -> bool:
+    """跟config.py的is_etf()規則一致(00631L/009816這類ETF代號開頭都是「00」)——這裡獨立定義
+    一份，理由跟整支腳本不import main.py一樣：避免引入main.py載入時的副作用，保持腳本獨立可執行。"""
+    return symbol.replace(".TW","").replace(".TWO","").startswith("00")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 以下複製自main.py，保持完全一致 ── 如果main.py改了這幾個函式，這裡要同步改
@@ -328,9 +335,12 @@ def fetch_1min_bars(api, symbol, days):
     print(f"  ✓ {symbol}: {len(bars)}根1分K棒（{start_d.strftime('%Y-%m-%d')}~{end_d.strftime('%Y-%m-%d')}）{status}")
     return bars
 
-def label_triple_barrier(bars, start_idx):
+def label_triple_barrier(bars, start_idx, symbol:str=None):
     """三道門檻標籤法：從start_idx+1開始往後看，看漲到+tp%或跌到-sl%哪個先發生，
-    或者撐到max_hold_min分鐘都沒碰到任一道門檻(垂直門檻)，用那時候的報酬率決定成功/失敗。"""
+    或者撐到max_hold_min分鐘都沒碰到任一道門檻(垂直門檻)，用那時候的報酬率決定成功/失敗。
+    修正：最後這個垂直門檻的判斷原本不分股票/ETF一律用個股的0.32%門檻——但00631L/009816這類ETF
+    證交稅比較低(0.1% vs 個股當沖0.15%)，實際打平成本只需要約0.27%，用個股門檻會讓ETF的一部分
+    「其實已經夠打平成本」的樣本被誤標成0(不獲利)，等於幫這兩檔的訓練標籤系統性地調得比實際更嚴格。"""
     entry_price = bars[start_idx]["close"]
     tp_price = entry_price * (1 + LABEL_TP_PCT/100)
     sl_price = entry_price * (1 - LABEL_SL_PCT/100)
@@ -339,7 +349,8 @@ def label_triple_barrier(bars, start_idx):
         if bars[j]["high"] >= tp_price: return 1
         if bars[j]["low"] <= sl_price: return 0
     final_ret = (bars[horizon_end]["close"] - entry_price) / entry_price * 100
-    return 1 if final_ret >= MIN_PROFITABLE_MOVE_PCT else 0
+    threshold = MIN_PROFITABLE_MOVE_PCT_ETF if (symbol and _is_etf(symbol)) else MIN_PROFITABLE_MOVE_PCT
+    return 1 if final_ret >= threshold else 0
 
 def build_dataset(api, symbols, days, stride=5):
     """對每檔股票，每隔stride根棒子取一個樣本點(不用每一根都取，減少高度重疊的樣本、加快訓練)，
@@ -378,7 +389,7 @@ def build_dataset(api, symbols, days, stride=5):
             tod_pct = get_time_of_day_pct(bars[i]["ts"])
             feats = extract_ml_features(sym, prices_all[w_start:i+1], volumes_all[w_start:i+1], entries[w_start:i+1], "L", mkt_ret, tod_pct)
             if feats is None: continue
-            label = label_triple_barrier(bars, i)
+            label = label_triple_barrier(bars, i, symbol=sym)
             X.append(feats); y.append(label)
             meta.append({"sym": sym, "idx": i})
             n_samples_this_sym += 1
