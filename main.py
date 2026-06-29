@@ -135,7 +135,7 @@ def _record_paper_validation(pnl:float=0.0, pct:float=0.0, held_min:float=0.0):
     這些數字本身不難算，難的是「資料根本沒被存下來」，trade_history每天被清空，這些統計量
     必須在這裡(不會被每日重置的地方)逐筆累積，不能事後從trade_history回頭算。"""
     pv=auto_state.setdefault("paper_validation",{"trade_count":0,"trading_days":[],
-                              "total_win_pnl":0.0,"total_loss_pnl":0.0,"wins":0,"losses":0,
+                              "total_win_pnl":0.0,"total_loss_pnl":0.0,"wins":0,"losses":0,"breakeven":0,
                               "win_pct_sum":0.0,"loss_pct_sum":0.0,
                               "largest_win_pnl":0.0,"largest_loss_pnl":0.0,
                               "current_streak":0,"max_win_streak":0,"max_loss_streak":0,
@@ -161,6 +161,14 @@ def _record_paper_validation(pnl:float=0.0, pct:float=0.0, held_min:float=0.0):
         cur=pv.get("current_streak",0)
         pv["current_streak"]=cur-1 if cur<=0 else -1
         pv["max_loss_streak"]=max(pv.get("max_loss_streak",0),abs(pv["current_streak"]))
+    else:
+        # 修正：pnl剛好等於0(扣完成本後完全打平)的交易，原本既不算贏也不算輸，直接被漏算——
+        # trade_count有計入這一筆，但wins/losses都沒有，導致使用者實際看到「1/20筆」卻
+        # 「0勝0敗」這種看起來自相矛盾的畫面(勝率分母wins+losses=0，顯示成0%，但其實是
+        # 「分母被悄悄縮小」，不是真的0%)。打平不算贏也不算輸沒問題，但至少要被計入某個
+        # 桶子，不能無聲消失；同時打斷目前的連勝/連敗紀錄(既不是「贏的延續」也不是「輸的延續」)。
+        pv["breakeven"]=pv.get("breakeven",0)+1
+        pv["current_streak"]=0
 
 def _record_feature_log(sym:str, pos:Dict, pnl:float, pct:float, tag:str):
     """每筆交易平倉時記錄當時餵給LightGBM的完整特徵向量+結果，跨天累積不會被_reset_daily清空。
@@ -180,7 +188,7 @@ def _paper_validation_progress() -> dict:
     pv=auto_state.get("paper_validation",{"trade_count":0,"trading_days":[]})
     trades=pv.get("trade_count",0); days=len(pv.get("trading_days",[]))
     ok = trades>=PAPER_VALIDATION_MIN_TRADES and days>=PAPER_VALIDATION_MIN_DAYS
-    wins=pv.get("wins",0); losses=pv.get("losses",0)
+    wins=pv.get("wins",0); losses=pv.get("losses",0); breakeven=pv.get("breakeven",0)
     total_win=pv.get("total_win_pnl",0.0); total_loss=pv.get("total_loss_pnl",0.0)
     # Profit Factor：總贏的錢/總輸的錢(取絕對值)，業界常用門檻是>1.5才算「具備實盤印鈔能力」
     # 修正：total_loss==0且total_win>0時，原本回傳float("inf")——這是合理的數學結果(分母是0，
@@ -190,7 +198,11 @@ def _paper_validation_progress() -> dict:
     # 改成回傳None(對應JSON的null)，前端原本就已經把profit_factor===null當成「顯示∞」的條件之一，
     # 不需要額外改前端。
     profit_factor=round(total_win/abs(total_loss),2) if total_loss!=0 else (None if total_win>0 else 0.0)
-    win_rate=round(wins/(wins+losses)*100,1) if (wins+losses)>0 else 0.0
+    # 修正：勝率分母原本是wins+losses，但pnl恰好0(打平)的交易既不算wins也不算losses，
+    # 會讓這個分母悄悄縮小——使用者實際看到「1/20筆」卻「0勝0敗」就是這個分母跟trade_count
+    # 對不起來造成的。改成用trades(完整已平倉筆數，跟畫面上「已完成X筆」是同一個數字)當分母，
+    # 打平的交易會正確稀釋勝率(不算贏，但分母還是+1)，不會再悄悄消失於計算之外。
+    win_rate=round(wins/trades*100,1) if trades>0 else 0.0
     avg_win_pct=round(pv.get("win_pct_sum",0.0)/wins,2) if wins>0 else 0.0
     avg_loss_pct=round(pv.get("loss_pct_sum",0.0)/losses,2) if losses>0 else 0.0
     # 期望值(Expectancy)：平均每一筆交易賺賠多少錢，是判斷一個策略「平均每動一次手會發生什麼事」
@@ -201,6 +213,7 @@ def _paper_validation_progress() -> dict:
     return {"trades":trades,"days":days,"min_trades":PAPER_VALIDATION_MIN_TRADES,
             "min_days":PAPER_VALIDATION_MIN_DAYS,"ready_for_real":ok,
             "win_rate":win_rate,"profit_factor":profit_factor,
+            "wins":wins,"losses":losses,"breakeven":breakeven,
             "avg_win_pct":avg_win_pct,"avg_loss_pct":avg_loss_pct,
             "total_pnl":round(total_win+total_loss,0),
             "expectancy_per_trade":expectancy,
