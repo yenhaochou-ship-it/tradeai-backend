@@ -173,7 +173,13 @@ def _paper_validation_progress() -> dict:
     wins=pv.get("wins",0); losses=pv.get("losses",0)
     total_win=pv.get("total_win_pnl",0.0); total_loss=pv.get("total_loss_pnl",0.0)
     # Profit Factor：總贏的錢/總輸的錢(取絕對值)，業界常用門檻是>1.5才算「具備實盤印鈔能力」
-    profit_factor=round(total_win/abs(total_loss),2) if total_loss!=0 else (float("inf") if total_win>0 else 0.0)
+    # 修正：total_loss==0且total_win>0時，原本回傳float("inf")——這是合理的數學結果(分母是0，
+    # 獲利因子無限大)，但Python的inf沒辦法被json.dumps序列化，會讓整個/auto/status跟/auto/validation
+    # 直接crash(ValueError: Out of range float values are not JSON compliant)。這不是邊緣案例，
+    # 是「驗證期只贏沒輸過」這種完全合理、甚至可能常見的情況(尤其剛開始累積樣本時)。
+    # 改成回傳None(對應JSON的null)，前端原本就已經把profit_factor===null當成「顯示∞」的條件之一，
+    # 不需要額外改前端。
+    profit_factor=round(total_win/abs(total_loss),2) if total_loss!=0 else (None if total_win>0 else 0.0)
     win_rate=round(wins/(wins+losses)*100,1) if (wins+losses)>0 else 0.0
     avg_win_pct=round(pv.get("win_pct_sum",0.0)/wins,2) if wins>0 else 0.0
     avg_loss_pct=round(pv.get("loss_pct_sum",0.0)/losses,2) if losses>0 else 0.0
@@ -225,8 +231,10 @@ def _check_drawdown_circuit_breaker() -> bool:
         auto_state["drawdown_halt_info"]={"peak_equity":round(peak,2),"current_equity_est":round(current_est,2),
                                            "drawdown_pct":round(dd_pct,2),"mode":cur_mode,
                                            "triggered_at":tw_now().strftime("%Y-%m-%d %H:%M:%S")}
-        _log(f"⚠️⚠️⚠️ [回撤保護觸發] {'模擬' if cur_mode=='paper' else '真實'}帳戶估計權益較歷史高點(${peak:,.0f})回撤{dd_pct:.1f}%，已達{MAX_DRAWDOWN_HALT_PCT}%門檻，"
+        msg=(f"⚠️⚠️⚠️ [回撤保護觸發] {'模擬' if cur_mode=='paper' else '真實'}帳戶估計權益較歷史高點(${peak:,.0f})回撤{dd_pct:.1f}%，已達{MAX_DRAWDOWN_HALT_PCT}%門檻，"
              f"停止開新倉(現有持倉仍會正常出場)。需要到系統分頁手動確認後才會恢復，不會隔天自動恢復。")
+        _log(msg)
+        send_telegram_alert(f"🚨 TradeAI Pro\n{msg}")
         _persist_auto_state()
         return True
     return False
@@ -324,9 +332,11 @@ def watchdog_check():
     gap=time.time()-_watchdog_state["last_tick_at"]
     if gap>WATCHDOG_THRESHOLD_SECONDS:
         if not _watchdog_state["alerted"]:
-            _log(f"⚠️⚠️⚠️ [看門狗警示] 主交易迴圈已經{gap:.0f}秒沒有心跳(正常應該30秒一次)，"
+            msg=(f"⚠️⚠️⚠️ [看門狗警示] 主交易迴圈已經{gap:.0f}秒沒有心跳(正常應該30秒一次)，"
                  f"可能已經停止監控停損停利！目前{'有' if auto_state['positions'] else '沒有'}持倉，"
                  f"請立刻檢查伺服器狀態，必要時手動到永豐app/網頁平倉。")
+            _log(msg)
+            send_telegram_alert(f"🚨 TradeAI Pro\n{msg}")
             _watchdog_state["alerted"]=True
     else:
         _watchdog_state["alerted"]=False
@@ -483,6 +493,27 @@ def _log(msg:str, sym:str="系統"):
     auto_state["log"].insert(0,entry)
     auto_state["log"]=auto_state["log"][:100]
     logger.info(f"[Auto] {sym}: {msg}")
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN","")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","")
+
+def send_telegram_alert(message:str) -> bool:
+    """傳送Telegram通知，只用在真正重要、需要使用者立刻知道的事件(回撤保護觸發/看門狗心跳異常/
+    強制平倉失敗/緊急停止)，不是每筆交易都通知，避免疲勞轟炸讓人最後關掉手機通知。
+    沒有設定TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID這兩個環境變數時安靜跳過，不影響其他功能正常運作——
+    這是選配功能，沒設定的人系統照常運行，只是少了主動通知這一層。"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        resp=requests.post(url,data={"chat_id":TELEGRAM_CHAT_ID,"text":message},timeout=5)
+        if resp.status_code!=200:
+            logger.warning(f"Telegram通知傳送失敗(status={resp.status_code}): {resp.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"Telegram通知傳送失敗: {e}")
+        return False
 
 def _snapshot(sym:str) -> Optional[Dict]:
     """回傳完整快照欄位(price/volume/buy_vol/sell_vol/tick_type)，不再只取price+volume兩個欄位。
@@ -669,18 +700,26 @@ def auto_trade_tick():
     _update_cache()
     _apply_order_events()  # 處理委託回報callback記錄到的取消/失敗事件，盡快反應(不用等reconcile_real_positions的2分鐘週期)
     if auto_state["pause_until"]>time.time(): return
-    if auto_state["capital"]<=0:
+    # 修正：這幾道安全閥原本不分模式，一律檢查auto_state["capital"](真實帳戶的可用資金)——
+    # 但真實帳戶的可用資金完全由外部的T+2交割時間表決定，跟模擬模式的表現毫無關係。一旦真實帳戶
+    # 可用資金剛好是0(例如被應付款卡住，這是正常會發生的真實狀況，不是bug)，這幾道閥會在每個tick
+    # 一開始就return，連候選股票迴圈都進不去——等於模擬模式被真實帳戶的資金狀況意外卡死，
+    # 整天「掃描0次、成功進場0筆」，但其他不檢查這個欄位的功能(例如全市場掃描的飆股雷達)
+    # 看起來完全正常運作，很容易誤以為系統卡住了找不到原因。改成跟候選迴圈算部位大小時
+    # 用的同一個effective_capital(模擬模式看paper_capital，真實模式才看真實capital)。
+    effective_capital=get_paper_available_capital() if auto_state.get("paper_mode") else auto_state["capital"]
+    if effective_capital<=0:
         # 修正：可用資金被待交割款吃光時capital會是0(這是真實狀況，不是bug，見main.py的_refresh_capital_from_account)，
         # 這裡要明確擋下來當成「今天沒錢可動用，暫停」處理——不只是防呆，0元帳戶本來就不該繼續嘗試任何新倉位計算，
         # 而且下面daily_pnl/capital這個除法，capital=0會直接讓整個tick crash，每30秒crash一次，必須在這裡先擋掉。
         if not auto_state.get("_zero_capital_logged"):
             _log("[暫停]目前可用資金為0(待交割款佔用)，暫停今日交易直到資金恢復"); auto_state["_zero_capital_logged"]=True
         return
-    if abs(min(0,auto_state["daily_pnl"]))/auto_state["capital"]*100>=3:
+    if abs(min(0,auto_state["daily_pnl"]))/effective_capital*100>=3:
         if not auto_state.get("_loss_stop_logged"):
             _log("[停止]今日虧損達3%，停止交易"); auto_state["_loss_stop_logged"]=True
         return
-    if auto_state["daily_pnl"]/auto_state["capital"]*100>=8:
+    if auto_state["daily_pnl"]/effective_capital*100>=8:
         if not auto_state.get("_profit_lock_logged"):
             _log("[鎖定]今日獲利達8%，鎖定獲利"); auto_state["_profit_lock_logged"]=True
         return
@@ -812,8 +851,7 @@ def auto_trade_tick():
     fn=auto_state["funnel"]
     # 效能：大盤同步性跟個股無關，這個tick只要算一次，不要讓底下每檔股票各自重算一次一樣的結果
     market_ctx=get_market_context()
-    # 模擬模式用獨立的模擬資金算部位大小，不要被真實帳戶的T+2交割卡住；真實模式才用真實capital。
-    effective_capital=get_paper_available_capital() if auto_state.get("paper_mode") else auto_state["capital"]
+    # effective_capital已經在函式前面算過一次了(同一個tick內資金不會變，不用重算)
     for sym in candidates_pool:
         try:
             if sym in existing: continue
@@ -957,20 +995,23 @@ def pre_market_prep():
     _reset_daily(); _update_cache()
     _log("08:00 開盤前準備，更新價格快取與昨日資料 ✓")
 
-def force_close_all():
+def force_close_all(reason:str="13:20強制平倉（當沖規則：禁止留倉過夜）"):
     if not auto_state["positions"]: return
-    _log(f"13:20 強制平倉 {len(auto_state['positions'])} 筆（當沖規則：禁止留倉過夜）")
+    is_scheduled="13:20" in reason
+    _log(f"{reason} {len(auto_state['positions'])} 筆")
     still_open=[]
     for pos in list(auto_state["positions"]):
         sym=pos["sym"]
         act=sj.constant.Action.Sell if pos["dir"]=="L" else sj.constant.Action.Buy
         fc_ok,_fc_oid=_place_real_order(sym,act,pos["qty"])
         if not fc_ok:
-            # 修正：強制平倉失敗(例如剛好跌停鎖死)是真正需要使用者注意的情況——已經是13:20了，
-            # 不像一般時段還有很多次30秒tick可以重試，視窗快關了。不往下記錄成已平倉，
-            # 保留在positions裡讓使用者在畫面上看得到「這筆沒有真的平倉成功」，需要去手動處理。
+            # 修正：強制平倉失敗(例如剛好跌停鎖死)是真正需要使用者注意的情況——不管是排定的13:20
+            # 還是使用者自己手動觸發的緊急停止，視窗都快關了，不像一般時段還有很多次30秒tick可以重試。
+            # 不往下記錄成已平倉，保留在positions裡讓使用者在畫面上看得到「這筆沒有真的平倉成功」，
+            # 需要去手動處理。
             fn=auto_state["funnel"]; fn["order_failed"]=fn.get("order_failed",0)+1
             _log(f"[強制平倉失敗]{sym} 委託被拒絕(可能漲跌停鎖死)，這筆會留倉過夜，請手動確認",sym)
+            send_telegram_alert(f"🚨 TradeAI Pro\n[強制平倉失敗] {sym} {reason}委託被拒絕(可能漲跌停鎖死)，這筆會留倉過夜，請手動到永豐app/網頁確認處理。")
             still_open.append(pos)
             continue
         try:
@@ -992,19 +1033,20 @@ def force_close_all():
             auto_state["daily_pnl"]+=net_pnl; auto_state["daily_trades"]+=1
             if net_pnl>0: auto_state["daily_win"]+=1; auto_state["consec_loss"]=0
             else: auto_state["consec_loss"]+=1
-            _log(f"[強制平倉] {pos['dir']} @{fill_p:.2f} 淨損益${net_pnl:.0f}",sym)
+            _log(f"[{'強制平倉' if is_scheduled else '緊急停止平倉'}] {pos['dir']} @{fill_p:.2f} 淨損益${net_pnl:.0f}",sym)
             pp_fc=(fill_p-pos["entry"])/pos["entry"]*100*(1 if pos["dir"]=="L" else -1)
             auto_state["trade_history"].insert(0,{
                 "sym":sym,"dir":pos["dir"],"qty":pos["qty"],"shares":shares,
                 "entry":pos["entry"],"exit":round(fill_p,2),
                 "total_cost_basis":round(pos["entry"]*shares,0),
                 "gross_pnl":round(gross,0),"fees":round(cost,0),
-                "pnl":round(net_pnl,0),"pct":round(pp_fc,2),"tag":"強制平倉",
+                "pnl":round(net_pnl,0),"pct":round(pp_fc,2),"tag":"強制平倉" if is_scheduled else "緊急停止平倉",
                 "open_time":pos.get("open_time",""),"close_time":tw_now().strftime("%H:%M:%S"),
                 "settlement_date":settlement_date,
                 "from_pool": sym not in auto_state["watchlist"],
                 "grade":pos.get("grade","-"),"regime":pos.get("regime","-"),
-                "entry_reason":pos.get("entry_reason","-"),"exit_reason":"13:20當沖規定強制平倉，不留倉過夜",
+                "entry_reason":pos.get("entry_reason","-"),
+                "exit_reason":"13:20當沖規定強制平倉，不留倉過夜" if is_scheduled else "使用者手動觸發緊急停止平倉",
             })
             auto_state["trade_history"]=auto_state["trade_history"][:50]
             if auto_state.get("paper_mode"):
@@ -1235,7 +1277,7 @@ def get_status():
         "auto_enabled":auto_state["enabled"],
         "paper_mode":auto_state.get("paper_mode",True),
         "daily_pnl":round(auto_state["daily_pnl"],0),
-        "daily_pnl_pct":round(auto_state["daily_pnl"]/(auto_state["capital"] or 1)*100,2),
+        "daily_pnl_pct":round(auto_state["daily_pnl"]/((get_paper_available_capital() if auto_state.get("paper_mode") else auto_state["capital"]) or 1)*100,2),
         "win_rate":wr,
         "daily_trades":auto_state["daily_trades"],
         "positions_count":len(auto_state["positions"]),
@@ -1281,7 +1323,8 @@ async def connect(req:ConnectRequest, background_tasks:BackgroundTasks):
         # 跟修正②的「買不起就跳過」邏輯互相矛盾——預算算錢用的資金不準，跳過判斷自然也不準。改成連線後立刻同步刷新。
         cap_info=_refresh_capital_from_account()
         if cap_info:
-            _log(f"資金已同步：可用NT${cap_info['available_after_settlement']:.0f}（扣除待交割款）")
+            paper_note="（目前是模擬下單，這個數字不影響模擬交易，模擬模式用的是獨立的模擬資金）" if auto_state.get("paper_mode") else ""
+            _log(f"真實帳戶資金已同步：可用NT${cap_info['available_after_settlement']:.0f}（扣除待交割款）{paper_note}")
         _log(f"永豐帳戶連接成功 CA={'✓' if ca_ok else '✗'}")
         background_tasks.add_task(scan_top_stocks)  # 連線成功後立即在背景開始掃描，不用等5分鐘排程
         # 模組一：註冊tick+bidask callback並訂閱即時OFI資料流(watchlist+股票池)，背景執行避免拖慢連線回應
@@ -1370,6 +1413,26 @@ async def auto_stop():
     _log("後端自動交易已停止")
     _persist_auto_state()
     return {"success":True}
+
+@app.post("/auto/emergency-stop")
+async def emergency_stop():
+    """一鍵緊急停止：跟一般的/auto/stop不一樣——一般stop只擋新倉，現有持倉還是會留給正常出場
+    邏輯慢慢處理(可能要等實際觸發停損停利，或等到13:20的排程強制平倉)。這個是「現在立刻全部停下來」
+    的最後手段：立刻停止自動交易，並馬上嘗試平倉所有現有持倉，不等任何排程時間。
+    直接重用force_close_all()的平倉邏輯(不是另外重寫一套)，平倉失敗的處理方式跟13:20強制平倉
+    完全一致——失敗的會留在positions裡讓你看得到、需要手動處理，不會假裝平倉成功。"""
+    auto_state["enabled"]=False
+    n_before=len(auto_state["positions"])
+    force_close_all(reason="使用者手動觸發緊急停止，立即平倉")
+    n_after=len(auto_state["positions"])
+    n_closed=n_before-n_after
+    msg=f"🛑 緊急停止已執行：已停止自動交易，嘗試平倉{n_before}筆持倉，成功{n_closed}筆"
+    if n_after>0:
+        msg+=f"，{n_after}筆平倉失敗(留倉，請手動到永豐app/網頁處理)"
+    _log(msg)
+    send_telegram_alert(f"🛑 TradeAI Pro\n{msg}")
+    _persist_auto_state()
+    return {"success":True,"positions_before":n_before,"closed":n_closed,"failed":n_after,"message":msg}
 
 @app.post("/auto/reset-daily")
 async def reset_daily_stats():
