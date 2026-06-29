@@ -1,0 +1,87 @@
+{
+  "trained_at": "2026-06-29T23:44:47.893622+08:00",
+  "auc": 0.6323,
+  "accuracy": 0.7672,
+  "n_samples": 138091,
+  "positive_ratio": 0.2815,
+  "days": 90,
+  "n_symbols": 48,
+  "stride": 5,
+  "old_auc": 0.6293,
+  "auc_diff": 0.003,
+  "real_data_used": false,
+  "feature_importance": [
+    [
+      "market_return_5m_pct",
+      5319
+    ],
+    [
+      "price_vwap_dev_pct",
+      3477
+    ],
+    [
+      "ma5_ma20_dev_pct",
+      3462
+    ],
+    [
+      "vol_ratio",
+      3447
+    ],
+    [
+      "cci",
+      3101
+    ],
+    [
+      "volume_quality_score",
+      3042
+    ],
+    [
+      "trend_str",
+      2383
+    ],
+    [
+      "rsi",
+      2231
+    ],
+    [
+      "williams_r",
+      1181
+    ],
+    [
+      "regime_code",
+      213
+    ],
+    [
+      "mtf_aligned_code",
+      147
+    ],
+    [
+      "bid_ask_imbalance",
+      0
+    ],
+    [
+      "order_flow_delta_scaled",
+      0
+    ],
+    [
+      "orb_breakout",
+      0
+    ],
+    [
+      "real_ofi_interval",
+      0
+    ],
+    [
+      "real_big_trade_interval_scaled",
+      0
+    ],
+    [
+      "spread_pct",
+      0
+    ],
+    [
+      "time_of_day_pct",
+      0
+    ]
+  ]
+}
