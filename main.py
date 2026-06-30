@@ -1642,15 +1642,23 @@ async def auto_status():
             _log(f"✅ LightGBM模型已載入：{lgbm_status['path']}")
         else:
             _log(f"⚠️ LightGBM模型尚未載入：{lgbm_status['error']}")
+    # 優化：原本compute_performance_metrics()在這裡被呼叫3次——一次用「目前模式」、一次"real"、
+    # 一次"paper"，但「目前模式」那次的結果，本來就跟後面兩次裡其中一次完全相同(paper_mode=True時，
+    # "目前模式"算出來的東西就是"paper"那次的重複)。equity_curve目前資料量很小(一天最多新增1筆)，
+    # 重複算3次實際耗時差異可以忽略，但這是清楚可避免的浪費，尤其這支端點每30秒被前端輪詢一次，
+    # 一整天下來是上千次不必要的重複計算。改成"paper"/"real"各算一次，「目前模式」直接從這兩個
+    # 已經算好的結果取用，不再重新呼叫第三次。
+    _pm_real=compute_performance_metrics("real")
+    _pm_paper=compute_performance_metrics("paper")
     return {**auto_state,"market":market_status(),
             "paper_available_capital":round(get_paper_available_capital(auto_state),2),
             "min_profitable_move_pct":round(min_profitable_move_pct(auto_state.get("fee_discount",FEE_DISCOUNT)),3),
             "paper_validation_min_trades":PAPER_VALIDATION_MIN_TRADES,
             "paper_validation_min_days":PAPER_VALIDATION_MIN_DAYS,
             "paper_validation_progress":_paper_validation_progress(),
-            "performance_metrics":compute_performance_metrics("paper" if auto_state.get("paper_mode") else "real"),
-            "performance_metrics_real":compute_performance_metrics("real"),
-            "performance_metrics_paper":compute_performance_metrics("paper"),
+            "performance_metrics":_pm_paper if auto_state.get("paper_mode") else _pm_real,
+            "performance_metrics_real":_pm_real,
+            "performance_metrics_paper":_pm_paper,
             "lgbm_model":lgbm_status,
             "price_cache_size":{k:len(v) for k,v in price_cache.items()},
             "watchdog":{"seconds_since_tick":round(time.time()-_watchdog_state["last_tick_at"],1),
@@ -1868,6 +1876,46 @@ async def get_price(symbol:str):
                 "open":float(s.open),"high":float(s.high),"low":float(s.low)}
     except HTTPException: raise
     except Exception as e:
+        raise HTTPException(status_code=500,detail=str(e))
+
+@app.get("/prices")
+async def get_prices(symbols:str):
+    """優化：前端原本對自選股清單裡每一檔個別打一次/price/{symbol}(15秒一輪詢，watchlist若有
+    N檔就是N個並行請求，每個請求都要繞browser→Vercel→Railway→永豐這條完整路徑)，改成這裡一次
+    接受逗號分隔的多檔代號、用Shioaji原生支援的批次snapshots()一次查完，前端15秒的輪詢
+    從N個請求變成1個。
+    刻意不重用_snapshot_batch()/_parse_snapshot()(那兩個是給main.py自己的交易決策迴圈用，
+    只解析price/volume/buy_vol/sell_vol/tick_type這幾個交易判斷需要的欄位)——這裡需要的是
+    change/change_percent/name這些畫面顯示用的欄位，獨立寫一份，不去動交易核心路徑在用的東西，
+    降低互相影響的風險。"""
+    if not sinopac_api: raise HTTPException(status_code=401,detail="尚未連接")
+    syms=[s.strip().replace(".TW","").replace(".TWO","") for s in symbols.split(",") if s.strip()]
+    if not syms: return {}
+    try:
+        contracts=[]; contract_by_code={}
+        for sym in syms:
+            c=sinopac_api.Contracts.Stocks.get(sym)
+            if c:
+                contracts.append(c)
+                contract_by_code[getattr(c,"code",sym)]=(sym,c)
+        if not contracts: return {}
+        snaps=sinopac_api.snapshots(contracts)
+        out={}
+        for snap in (snaps or []):
+            code=getattr(snap,"code",None)
+            hit=contract_by_code.get(code)
+            if hit is None: continue
+            sym,contract=hit
+            try:
+                out[sym]={"symbol":sym,"name":str(getattr(contract,"name","")),
+                          "price":float(snap.close),"change":float(getattr(snap,"change_price",0) or 0),
+                          "change_percent":float(getattr(snap,"change_rate",0) or 0),
+                          "volume":int(getattr(snap,"total_volume",0) or 0)}
+            except Exception:
+                continue  # 單檔解析失敗不影響其他檔，呼叫端用.get(sym)處理缺漏(跟/price/{symbol}的404處理方式一致)
+        return out
+    except Exception as e:
+        logger.warning(f"批次查詢報價失敗: {e}")
         raise HTTPException(status_code=500,detail=str(e))
 
 # ── 交割記錄 ──────────────────────────────────────────────────────
