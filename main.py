@@ -1339,7 +1339,25 @@ def _refresh_capital_from_account():
 # ══════════════════════════════════════════════════════════════════
 # 排程器啟動
 # ══════════════════════════════════════════════════════════════════
-scheduler=BackgroundScheduler(timezone='Asia/Taipei')
+# 深層檢查發現：BackgroundScheduler預設用執行緒池(ThreadPoolExecutor)執行排程的工作，
+# 下面這6個工作(尤其auto_trade_tick/watchdog_check同樣是30秒一次，幾乎每次都會在同一時刻
+# 被觸發)完全有可能在不同執行緒上同時執行，但全部都在讀寫同一份共用、沒有任何鎖保護的
+# auto_state字典——其中好幾個是「複合」操作(例如trade_history的insert再slice成兩步、
+# paper_validation一次要更新好幾個欄位再append到trade_log)，這種複合操作不是Python GIL
+# 保證的單一bytecode操作，兩個執行緒交錯執行時有遺失更新的風險(例如一筆trade_history被
+# 蓋掉、trade_count跟trade_log筆數對不起來)。改成強制只用1個工作執行緒，讓這些排程工作
+# 彼此序列化執行(同一時間只有1個在跑)，完全消除這整類競爭風險——代價只是某個工作偶爾會
+# 因為前一個還沒跑完而延後個幾秒才開始，這對這個系統完全不是問題(30秒週期本身就留了
+# 很多餘裕，沒有任何一個工作要求毫秒級準時)。同時設定一個寬鬆的misfire_grace_time，
+# 確保「因為排隊而延後」的工作會補跑(只是晚一點)，不會因為APScheduler預設只給1秒的
+# 寬限時間，被誤判成「太晚了，乾脆跳過」而整次不跑(尤其auto_trade_tick如果被跳過，
+# 等於那30秒完全沒人在看停損停利，這是不能接受的)。
+from apscheduler.executors.pool import ThreadPoolExecutor as _ApschedulerThreadPoolExecutor
+scheduler=BackgroundScheduler(
+    timezone='Asia/Taipei',
+    executors={'default': _ApschedulerThreadPoolExecutor(max_workers=1)},
+    job_defaults={'misfire_grace_time': 25},  # 25秒寬限(略小於最短的30秒間隔)，被前一個工作卡住時仍會補跑，不會被跳過
+)
 scheduler.add_job(auto_trade_tick,    'interval',seconds=30,id='tick',replace_existing=True)
 scheduler.add_job(watchdog_check,     'interval',seconds=30,id='watchdog',replace_existing=True)
 scheduler.add_job(reconcile_real_positions,'interval',seconds=120,id='reconcile',replace_existing=True) # 真實模式持倉核對，每2分鐘一次(安全網而非主要機制，不需要跟30秒tick一樣頻繁)
