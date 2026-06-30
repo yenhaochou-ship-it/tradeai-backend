@@ -98,9 +98,14 @@ _auto_state_defaults = {
     # 直接回答「今天為什麼沒有交易」，不用再去猜log文字背後的原因。
     "funnel":{"scanned":0,"bad_time":0,"no_trade_zone":0,"not_eligible":0,"limit_down_risk":0,
               "vwap_reject":0,"wide_spread":0,"extreme_recent_move":0,"no_model":0,"low_confidence":0,"sector_dup":0,"unaffordable":0,
-              "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0,"order_failed":0},
+              "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0,"order_failed":0,"cache_warming":0},
     "ofi_failed_symbols":[],  # OFI訂閱失敗的股票代號清單，點log時顯示具體是哪幾檔
     "capital_info":None,  # 最近一次資金同步的完整明細(balance/available/pending_settlement/available_after_settlement)
+    # 修正：funnel只回答「今天累計卡在哪一關幾次」(混合candidates_pool裡全部symbol、整天累積)，
+    # 沒辦法回答使用者更直覺的問題「我自選股清單裡的XX，現在到底卡在哪」——使用者要自己土法煉鋼
+    # 解讀一堆數字才能猜。last_eval只留「每個symbol最新一次」的評估結果(不是累積次數)，
+    # key直接沿用funnel同一套reason命名，前端可以共用同一份FUNNEL_LABELS中文對照表。
+    "last_eval":{},  # {symbol: {"reason":str,"ts":float,"conf":float|None,"detail":str|None}}
 }
 auto_state = db_load("auto_state", None) or dict(_auto_state_defaults)
 # 資料庫存的舊資料可能缺少新版新增的欄位，補齊避免KeyError
@@ -643,7 +648,8 @@ def _reset_daily():
             "_loss_stop_logged":False,"_profit_lock_logged":False,"_afford_warn_logged":False,"_zero_capital_logged":False,"trade_history":[],
             "funnel":{"scanned":0,"bad_time":0,"no_trade_zone":0,"not_eligible":0,"limit_down_risk":0,
                       "vwap_reject":0,"wide_spread":0,"extreme_recent_move":0,"no_model":0,"low_confidence":0,"sector_dup":0,"unaffordable":0,
-                      "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0,"order_failed":0}})
+                      "daily_cap_reached":0,"per_tick_cap_reached":0,"opened":0,"order_failed":0,"cache_warming":0},
+            "last_eval":{}})
         _prune_settled_paper_pending()
         _log("每日計數器重置 ✓")
 
@@ -725,6 +731,15 @@ def _place_real_order(sym:str, action, qty:int) -> Tuple[bool,Optional[str]]:
     except Exception as e:
         logger.warning(f"委託失敗 {sym}: {e}")
         return False,None
+
+def _mark_eval(sym:str, reason:str, conf:float=None, detail:str=None):
+    """記錄某symbol「最新一次」評估結果(卡在哪一關，或成功進場/送單失敗)——
+    跟funnel不一樣：funnel是「今天累計次數」(混合candidates_pool所有symbol整天疊加)，
+    這裡只保留每個symbol最新狀態，回答的是「我自選股的XX現在卡在哪」這種直覺問題，
+    不用使用者自己去解讀一整天累積、混合48檔股票的漏斗數字才能猜。
+    reason直接沿用funnel同一套key命名(bad_time/vwap_reject/low_confidence/...)，
+    前端可以共用同一份FUNNEL_LABELS中文對照表顯示，不用重複定義一份新的。"""
+    auto_state.setdefault("last_eval",{})[sym]={"reason":reason,"ts":time.time(),"conf":conf,"detail":detail}
 
 def auto_trade_tick():
     """每30秒執行 — 核心自動交易"""
@@ -886,23 +901,33 @@ def auto_trade_tick():
         try:
             if sym in existing: continue
             hist=price_cache.get(sym,[])
-            if len(hist)<30: continue
+            if len(hist)<30:
+                # 修正：原本這裡直接continue，這檔候選不會被算進funnel的任何一個桶子——
+                # 後端剛重啟(例如每次git push觸發Railway重新部署)時price_cache是空的，
+                # 要等_update_cache()每30秒生效1次，累積到30筆需要15分鐘，這段空窗期內
+                # 候選股票會「整批消失」，今日交易漏斗顯示「掃描0次」，跟「規則太嚴格擋下所有候選」
+                # 完全無法分辨，使用者只能憑空猜測到底是哪一種。記到cache_warming這個獨立桶子，
+                # 一看就知道是「還在暖機」不是「規則擋下」。
+                fn["cache_warming"]=fn.get("cache_warming",0)+1
+                _mark_eval(sym,"cache_warming")
+                continue
             fn["scanned"]+=1
             prices_h=[h["price"] for h in hist]; vols_h=[h["volume"] for h in hist]
             # 修正⑩：進場判斷主力換成LightGBM模型——sig還是要算，但只用bad_time(開盤前30分/收盤前)
             # 這個時間風控欄位，不再用sig['conf']/sig['action']決定要不要進場(那是被取代的"12項指標綜合評分")
             sig=calc_signal_py(prices_h,vols_h)
-            if sig.get("bad_time"): fn["bad_time"]+=1; continue
+            if sig.get("bad_time"): fn["bad_time"]+=1; _mark_eval(sym,"bad_time"); continue
             dir_="L"  # 規格要求：只看LightGBM「做多勝率」，當沖只做多單
             # 禁止交易區：國定假日/連續假日前收盤前/月結算日/量過低/波動度過低，這些情況下不進場(維持獨立硬性檢查)
             ntz,ntz_reason=is_no_trade_zone(prices_h,vols_h)
-            if ntz: fn["no_trade_zone"]+=1; continue
+            if ntz: fn["no_trade_zone"]+=1; _mark_eval(sym,"no_trade_zone",detail=ntz_reason); continue
             # 真實當沖資格檢查（用永豐合約真實資料：day_trade=No的處置股票/不符資格股票直接跳過，維持獨立硬性檢查）
             ok,reason = can_day_trade(sym, is_sell_first=False)
-            if not ok: fn["not_eligible"]+=1; continue
+            if not ok: fn["not_eligible"]+=1; _mark_eval(sym,"not_eligible",detail=reason); continue
             cinfo=get_contract_info(sym)
             p_now=hist[-1]["price"]
-            if cinfo["limit_down"]>0 and p_now<=cinfo["limit_down"]*1.005: fn["limit_down_risk"]+=1; continue  # 接近跌停，做多賣不掉風險高
+            if cinfo["limit_down"]>0 and p_now<=cinfo["limit_down"]*1.005:
+                fn["limit_down_risk"]+=1; _mark_eval(sym,"limit_down_risk"); continue  # 接近跌停，做多賣不掉風險高
             # 瞬間價格穩定機制(集合競價鎖死)風險的保守代理指標：台股規定若成交價超過前5分鐘滾動
             # 加權均價±3.5%，會強制進入2分鐘集合競價(暫緩撮合)。這裡沒有逐筆資料能驗證精確複製
             # 交易所的加權均價公式對不對，寧可保守一點不假裝精確——改用「最近5分鐘漲跌幅度」當代理：
@@ -915,11 +940,13 @@ def auto_trade_tick():
             if abs(ref_entry["t"]-target_ts)<=60 and ref_entry["price"]>0:
                 recent_move_pct=abs(p_now-ref_entry["price"])/ref_entry["price"]*100
                 if recent_move_pct>=3.0:
-                    fn["extreme_recent_move"]=fn.get("extreme_recent_move",0)+1; continue
+                    fn["extreme_recent_move"]=fn.get("extreme_recent_move",0)+1
+                    _mark_eval(sym,"extreme_recent_move",detail=f"{recent_move_pct:.1f}%")
+                    continue
             # 還是要算advanced_score：①VWAP硬否決規格明確要求保留 ②regime/orb/volume_quality等輸出
             # 現在角色變成「餵給LightGBM的特徵」+「事後顯示用的輔助資訊」，不再是獨立的進場門檻
             adv=advanced_score(sym,prices_h,vols_h,dir_)
-            if not adv["vwap_ok"]: fn["vwap_reject"]+=1; continue  # 規格明確要求保留的VWAP硬否決
+            if not adv["vwap_ok"]: fn["vwap_reject"]+=1; _mark_eval(sym,"vwap_reject"); continue  # 規格明確要求保留的VWAP硬否決
             # 買賣價差過濾：價差太寬，光是進場那一下就先吃掉一截停損空間，當沖薄利策略對這個特別敏感。
             # 修正：原本固定0.3%門檻，驗證時發現NT$12~16的便宜銀行股(2849/2836/2834，剛好是這個系統
             # 特地加入解決資金不足問題的那幾檔)，連最小可能的1個tick價差都已經超過0.3%，等於不管
@@ -928,16 +955,26 @@ def auto_trade_tick():
             # LightGBM評分繼續判斷)，避免訂閱還沒就位時就把全部候選都擋掉。
             spread_pct=get_latest_spread_pct(sym)
             if spread_pct is not None and spread_pct>max_allowed_spread_pct(p_now):
-                fn["wide_spread"]=fn.get("wide_spread",0)+1; continue
+                fn["wide_spread"]=fn.get("wide_spread",0)+1
+                _mark_eval(sym,"wide_spread",detail=f"價差{spread_pct:.2f}%")
+                continue
             # LightGBM做多勝率信心度——取代原本的12項指標評分跟進階評分(C級)門檻
             lgbm_conf,lgbm_feats=predict_lgbm_confidence(sym,prices_h,vols_h,dir_,market_ctx,spread_pct)
             if lgbm_conf is None:
                 fn["no_model"]+=1
+                _mark_eval(sym,"no_model")
                 continue  # 模型還沒訓練/載入失敗：誠實地不交易，不要悄悄退回舊邏輯製造「好像在運作」的假象
-            if lgbm_conf<cfg["min_conf"]: fn["low_confidence"]+=1; continue  # 沿用既有風險等級門檻(低72%/中68%/高65%)，只是現在門檻比的是模型機率
+            if lgbm_conf<cfg["min_conf"]:
+                fn["low_confidence"]+=1
+                _mark_eval(sym,"low_confidence",conf=lgbm_conf,detail=f"門檻{cfg['min_conf']}%")
+                continue  # 沿用既有風險等級門檻(低72%/中68%/高65%)，只是現在門檻比的是模型機率
             est_profit_score=lgbm_conf*cfg["tp"]
             candidates.append({"sym":sym,"sig":sig,"dir":dir_,"price":p_now,"est_profit_score":est_profit_score,
                                 "adv":adv,"lgbm_conf":lgbm_conf,"lgbm_feats":lgbm_feats})
+            # 注意：這裡還不是「成功進場」，只是通過了LightGBM門檻、進入候選名單，
+            # 還要在下面第二個迴圈跟其他候選比較排名、檢查板塊分散/資金是否足夠才會真的下單——
+            # 所以這裡先不標記"opened"，避免標記了卻後來沒真的買到，誤導使用者。
+            _mark_eval(sym,"pending_rank",conf=lgbm_conf,detail="已通過所有篩選，正在排名競爭名額")
         except Exception as e:
             # 防禦性隔離：單一股票的資料異常(任何原因，不只是已知的零成交量這種)絕對不能讓整個tick
             # 連帶評估失敗——少了這層保護，一檔有問題的股票會讓當次30秒週期裡其他45檔全部陪著一起跳過，
@@ -959,28 +996,51 @@ def auto_trade_tick():
     # 如果同一個tick有3、5檔同時信心度達標(例如台指期突然暴衝)，全部一次性送單會放大滑價跟頻寬延遲，
     # 只取當下排序後最強的1~2檔進場，其餘留給下一個30秒週期重新評估，不是浪費機會，是控制單次衝擊。
     MAX_NEW_ENTRIES_PER_TICK=2
-    for c in candidates:
+    for c_idx,c in enumerate(candidates):
         if len(auto_state["positions"])>=cfg["max_pos"]: break
-        if auto_state["daily_trades"]>=MAX_TRADES_PER_DAY: fn["daily_cap_reached"]+=1; break  # 風控新增：當日交易次數上限，避免訊號反覆觸發過度交易
-        if opened_this_tick>=MAX_NEW_ENTRIES_PER_TICK: fn["per_tick_cap_reached"]+=1; break
+        if auto_state["daily_trades"]>=MAX_TRADES_PER_DAY:
+            fn["daily_cap_reached"]+=1  # 風控新增：當日交易次數上限，避免訊號反覆觸發過度交易
+            # break會讓這個tick剩下還沒輪到的候選整批不再評估——它們「現在」卡住的原因就是這一條，
+            # 全部一起標記，不要只標記當下這一檔，不然使用者點開排名比較後面的候選會看到上次(可能
+            # 是好幾個tick以前)的舊原因，誤以為自己卡在別的關卡。
+            for remaining in candidates[c_idx:]: _mark_eval(remaining["sym"],"daily_cap_reached")
+            break
+        if opened_this_tick>=MAX_NEW_ENTRIES_PER_TICK:
+            fn["per_tick_cap_reached"]+=1
+            for remaining in candidates[c_idx:]: _mark_eval(remaining["sym"],"per_tick_cap_reached")
+            break
         sym,sig,dir_,p,adv,lgbm_conf,lgbm_feats=c["sym"],c["sig"],c["dir"],c["price"],c["adv"],c["lgbm_conf"],c["lgbm_feats"]
         # 板塊分散：同板塊已有持倉就跳過這個候選，避免集中壓在同一個產業（如同時押好幾家金融股）
         this_sector=SECTOR_MAP.get(sym)
-        if this_sector and this_sector in held_sectors: fn["sector_dup"]+=1; continue
+        if this_sector and this_sector in held_sectors:
+            fn["sector_dup"]+=1; _mark_eval(sym,"sector_dup",conf=lgbm_conf,detail=this_sector); continue
         # 修正②：原本用 max(1, …) 強制至少買1張，對高價股（如台積電2500+、健策3800+）來說，
         # 1張的曝險動輒幾百萬，遠超過風險設定要動用的資金（例：低風險alloc=5%，100K資金只想動用5,000元，
         # 卻被迫買下252萬元台積電，曝險是帳戶資金的25倍），導致小幅價格波動就被放大成鉅額虧損。
         # 改成：算出來的張數不到1張，就代表這檔股票對目前資金規模太貴，直接跳過、不強迫超額曝險。
         # 修正⑩：部位大小依LightGBM信心度分級加碼(S/A/B/C=100%/75%/50%/25%)，取代原本的進階評分分級。
         # 模組二：LightGBM機率動態部位縮放（連續線性比例），取代原本的離散分級加碼
-        alloc_ratio=calculate_dynamic_position_ratio(lgbm_conf,cfg["min_conf"],cfg["alloc"]*100)
+        # 使用者要求：模擬模式(paper_mode)不要被風險等級的alloc%(低5%/中10%/高20%)卡住可動用金額——
+        # 模擬帳戶是假錢，使用者明確說「所有的錢你都可以動」。真實下單(paper_mode=False)維持原本
+        # 不變，alloc%是保護真錢曝險的關鍵風控，不能因為這個要求被連帶放寬。
+        # 把calculate_dynamic_position_ratio的max_alloc_pct從cfg["alloc"]*100(5/10/20)
+        # 改成100，效果是：信心度沿著原本同一套0.3~1.0的線性比例，但動用的是全部資金的30%~100%，
+        # 不再被risk tier的5%上限卡住——同一檔股票信心度越高，部位越大，邏輯不變，只是上限放寬。
+        # 注意：MAX_AGGREGATE_EXPOSURE_PCT(總曝險30%上限)兩種模式都繼續適用、沒有放寬——這不是
+        # 額外的保守限制，是「模擬帳戶不能花超過自己有的錢」這個基本要求本身：total_exposure
+        # 在迴圈裡會隨著每筆新倉累加，如果完全不設任何曝險上限，同一個tick裡開好幾筆新倉時，
+        # 每一筆都會各自以為「全部資金都還沒被用掉」，加總起來可能讓模擬帳戶的曝險超過100%本金，
+        # 變成不合理的模擬結果，所以這道防線繼續保留。
+        alloc_pct=100.0 if auto_state.get("paper_mode") else cfg["alloc"]*100
+        alloc_ratio=calculate_dynamic_position_ratio(lgbm_conf,cfg["min_conf"],alloc_pct)
         budget=effective_capital*(auto_state["cap_pct"]/100)*alloc_ratio
         max_aggregate=effective_capital*MAX_AGGREGATE_EXPOSURE_PCT/100
-        budget=min(budget,max(0,max_aggregate-total_exposure))  # 受總曝險上限約束
+        budget=min(budget,max(0,max_aggregate-total_exposure))  # 受總曝險上限約束(兩種模式都適用，理由見上方註解)
         qty=int(budget/(p*1000))
         if qty<1:
             fn["unaffordable"]+=1
             skipped_unaffordable.append((sym,p))
+            _mark_eval(sym,"unaffordable",conf=lgbm_conf,detail=f"預算NT${budget:.0f}，1張需NT${p*1000:.0f}")
             continue
         grade=lgbm_grade(lgbm_conf)
         fill_p=_apply_slippage(p,is_buy=True)  # 模擬滑價：當沖只做多，買進假設要多付1個tick才成交
@@ -991,6 +1051,7 @@ def auto_trade_tick():
             # 修正：委託被立即拒絕時，絕對不能繼續往下記錄成持倉/扣模擬資金——
             # 不然會變成系統以為自己買到了，但永豐那邊根本沒有這筆交易，帳本直接對不起來。
             fn["order_failed"]=fn.get("order_failed",0)+1
+            _mark_eval(sym,"order_failed",conf=lgbm_conf)
             _log(f"[委託失敗]{sym} 買進委託被拒絕或送出失敗，不記錄為持倉",sym)
             continue
         if auto_state.get("paper_mode"): _record_paper_open(fill_p,qty*1000)
@@ -1008,15 +1069,19 @@ def auto_trade_tick():
         existing.add(sym)
         opened_this_tick+=1
         fn["opened"]+=1
+        _mark_eval(sym,"opened",conf=lgbm_conf,detail=f"{qty}張@{fill_p:.2f}")
         total_exposure+=p*qty*1000
         if this_sector: held_sectors.add(this_sector)
     # 透明度提示：修正②上線後，資金規模配不上整張交易（台股當沖只能整張，零股不開放當沖）時，
     # AI可能會整天都找不到「買得起」的標的而完全不下單——這不是bug，是修正後誠實反映風險，
     # 但每天只提示一次，讓使用者知道發生了什麼、該調整資金配置或股票池，而不是誤以為系統當機。
     if opened_this_tick==0 and skipped_unaffordable and not auto_state.get("_afford_warn_logged"):
-        budget=effective_capital*(auto_state["cap_pct"]/100)*cfg["alloc"]
+        # budget這裡只是給log訊息參考用的概估值(用grade=100%信心情境算最大可能預算)，跟上面迴圈裡
+        # 每個候選實際依信心度動態縮放的budget不會逐筆相等，僅供「目前資金規模大概能負擔多少」參考。
+        warn_alloc_pct=100.0 if auto_state.get("paper_mode") else cfg["alloc"]*100
+        budget=effective_capital*(auto_state["cap_pct"]/100)*(warn_alloc_pct/100)
         cheapest=min(skipped_unaffordable,key=lambda x:x[1])
-        _log(f"[提示]本輪{len(skipped_unaffordable)}檔候選股價超出目前資金配置上限（{auto_state['risk']}風險單筆預算NT${budget:.0f}，"
+        _log(f"[提示]本輪{len(skipped_unaffordable)}檔候選股價超出目前資金配置上限（{auto_state['risk']}風險單筆預算上限約NT${budget:.0f}，"
              f"最低價候選{cheapest[0]}@{cheapest[1]:.1f}仍需NT${cheapest[1]*1000:.0f}/張），暫無買得起的標的。"
              f"可提高cap_pct/資金規模，或將股票池調整為更低價的標的。")
         auto_state["_afford_warn_logged"]=True
@@ -1426,6 +1491,15 @@ async def connect(req:ConnectRequest, background_tasks:BackgroundTasks):
                 msg=f"OFI即時訂閱完成：{n_ok+already}/{len(ofi_symbols)}檔涵蓋，{n_failed}檔訂閱失敗，那些股票的order_flow特徵會用0中性值代替，看log warning找原因"
             _log(msg)
         background_tasks.add_task(_do_ofi_subscribe)
+        # 修正：原本只有/auto/start會呼叫_bootstrap_price_cache()暖機，但前端每次載入頁面
+        # 都會自動呼叫這支/connect(不會自動呼叫/auto/start，因為auto_state.enabled多半已經是
+        # True，不需要重新「啟動」)——後端每次重新部署(例如git push觸發Railway重新部署)後，
+        # price_cache會是空的，要等_update_cache()每30秒存1筆，累積到30筆门槛需要15分鐘，
+        # 這段時間「今日交易漏斗」會顯示「掃描0次」，跟「規則太嚴格擋下所有候選」幾乎無法分辨
+        # (這是使用者實際回報過的疑惑)。改成只要成功連線(不管是因為使用者按了「連接真實帳戶」
+        # 還是頁面自動重連)就背景暖機一次，已經夠新鮮的symbol(>=30筆)會被_bootstrap_price_cache
+        # 內部的長度檢查直接跳過，重複呼叫沒有額外成本，不需要額外判斷「要不要暖機」。
+        background_tasks.add_task(_bootstrap_price_cache)
         return {"success":True,"stock_account":str(stock_account) if stock_account else None,
                 "future_account":str(future_account) if future_account else None,
                 "total_accounts":len(accounts),"ca_activated":ca_ok}
